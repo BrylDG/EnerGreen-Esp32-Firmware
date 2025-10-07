@@ -263,18 +263,37 @@ def detect_appliance_event(reading):
                         }
                     }
 
+                    # --- Send signature to Cloud Function ---
                     try:
-                        resp = urequests.post(CLOUD_FUNCTION_URL_SIGNATURE, data=json.dumps(event_signature),
-                                              headers={"Content-Type": "application/json"})
-                        result = {}
+                        print("📡 Sending signature to:", CLOUD_FUNCTION_URL_SIGNATURE)
+                        resp = urequests.post(
+                            CLOUD_FUNCTION_URL_SIGNATURE,
+                            data=json.dumps(event_signature),
+                            headers={"Content-Type": "application/json"}
+                        )
+
                         try:
                             result = resp.json()
                         except Exception:
-                            print("⚠️ Signature response not JSON:", resp.text)
+                            print("⚠️ Cloud returned non-JSON response:", resp.text)
+                            result = {}
+
                         resp.close()
 
+                        # --- Extract results ---
                         appliance_id = result.get("applianceID")
                         appliance_name = result.get("applianceName", "Unknown")
+                        match_score = result.get("matchScore")
+
+                        # --- Interpret match confidence ---
+                        if match_score is not None:
+                            confidence = (1 - float(match_score)) * 100
+                            print("🤖 Match score:", round(float(match_score), 3),
+                                  "→ Confidence:", round(confidence, 1), "%")
+                        else:
+                            print("✨ New appliance registered in cloud (no previous match).")
+
+                        # --- Register device locally ---
                         if appliance_id:
                             connected_devices[appliance_id] = {
                                 "name": appliance_name,
@@ -282,11 +301,14 @@ def detect_appliance_event(reading):
                                 "powerFactor": sig_point["powerFactor"],
                                 "last_seen": now
                             }
-                            print("🔌 Device connected:", appliance_name, "(", appliance_id, ")")
+
+                            print("🔌 Device connected:", appliance_name, f"({appliance_id})")
+                            print(f"⚙️  Power: {sig_point['powerWatt']}W | PF: {sig_point['powerFactor']:.2f}")
                             print("📊 Devices connected:", len(connected_devices))
                             print_connected_devices()
                         else:
-                            print("⚠️ Signature stored but no applianceID returned.")
+                            print("⚠️ No appliance ID returned; cloud may have rejected signature.")
+
                     except Exception as e:
                         print("❌ Failed to send signature:", e)
                 else:
