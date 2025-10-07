@@ -1,8 +1,8 @@
 # main.py - EnerGreen ESP32 MicroPython Code with Appliance Signature Detection + Residual Disaggregation
-# PATCHED (Low-Wattage Fix + Heavy Load Fix)
+# PATCHED (Low-Wattage Fix + Heavy Load Fix + Timer Scope Fix)
 #  • Detects low-wattage devices (≥ 5 W)
-#  • Keeps robustness for heavy appliances
-#  • Adds low-power steady-state acceptance
+#  • Handles heavy loads robustly
+#  • Uses global timers for low-power detection (fixes '_low_on_timer' errors)
 
 import time
 import random
@@ -16,7 +16,7 @@ from machine import UART
 # --- Configuration ---
 USE_SIMULATED_DATA = False
 POWER_CHANGE_THRESHOLD_WATT = 1.5
-POWER_MIN_VALID_WATT = 0.5          # PATCH ↓ from 2.0 → detect small fans
+POWER_MIN_VALID_WATT = 0.5          # Detects small fans, chargers, etc.
 POWER_CHANGE_DEBOUNCE_SECONDS = 3
 REGULAR_READING_INTERVAL_SECONDS = 60
 
@@ -24,7 +24,7 @@ APPLIANCE_STABILIZATION_WINDOW = 8
 STABILIZATION_VARIATION_WATT = 80.0
 TRANSIENT_CAPTURE_WINDOW = 5
 MIN_RESIDUAL_WATT = 0.5
-MIN_RESIDUAL_RELATIVE = 0.02        # PATCH ↓ from 0.03
+MIN_RESIDUAL_RELATIVE = 0.02
 
 # --- Cloud & Wi-Fi config ---
 try:
@@ -53,7 +53,11 @@ active_events = []
 connected_devices = {}
 
 power_window = []
-POWER_WINDOW_SIZE = 8  # PATCH ↑ wider smoothing buffer
+POWER_WINDOW_SIZE = 8  # widened smoothing buffer
+
+# NEW: low-power detection timers
+low_on_timer = None
+low_off_timer = None
 
 # UART to PZEM
 pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=1000)
@@ -89,7 +93,7 @@ def sync_time_with_ntp(max_retries=10, timeout=5):
             print("NTP synced:", utime.localtime())
             return True
         except Exception as e:
-            print("NTP attempt", i+1, "failed:", e)
+            print("NTP attempt", i + 1, "failed:", e)
             time.sleep(timeout)
     print("NTP failed after retries")
     return False
@@ -109,7 +113,8 @@ def print_reading(reading):
 def list_connected_devices():
     if not connected_devices:
         return []
-    return [f"{info.get('name', 'Unknown')} ({aid}) - {info.get('powerWatt', 0)}W" for aid, info in connected_devices.items()]
+    return [f"{info.get('name', 'Unknown')} ({aid}) - {info.get('powerWatt', 0)}W"
+            for aid, info in connected_devices.items()]
 
 
 def print_connected_devices():
@@ -136,24 +141,24 @@ def pzem_data():
         if not response or len(response) < 21:
             return None
 
-        data = response[3:3+20]
+        data = response[3:3 + 20]
         if len(data) < 20:
             return None
 
         def u32_from_low_high(payload, offset):
-            low16 = int.from_bytes(payload[offset:offset+2], 'big')
-            high16 = int.from_bytes(payload[offset+2:offset+4], 'big')
+            low16 = int.from_bytes(payload[offset:offset + 2], 'big')
+            high16 = int.from_bytes(payload[offset + 2:offset + 4], 'big')
             return (high16 << 16) | low16
 
         voltage = int.from_bytes(data[0:2], 'big') / 10.0
         current_raw = u32_from_low_high(data, 2)
-        power_raw   = u32_from_low_high(data, 6)
-        energy_raw  = u32_from_low_high(data, 10)
-        frequency   = int.from_bytes(data[14:16], 'big') / 10.0
-        pf          = int.from_bytes(data[16:18], 'big') / 100.0
+        power_raw = u32_from_low_high(data, 6)
+        energy_raw = u32_from_low_high(data, 10)
+        frequency = int.from_bytes(data[14:16], 'big') / 10.0
+        pf = int.from_bytes(data[16:18], 'big') / 100.0
 
         current = current_raw / 1000.0
-        power   = power_raw / 10.0
+        power = power_raw / 10.0
         energy_kwh = energy_raw / 1000.0
 
         if not (0.0 <= voltage <= 300.0): return None
@@ -179,148 +184,162 @@ def pzem_data():
 
 # ----------------- Event Detection -----------------
 def detect_appliance_event(reading):
-    global last_power_reading, debounce_active, debounce_start_time, debounce_event_type, active_events
+    global last_power_reading, debounce_active, debounce_start_time, debounce_event_type
+    global active_events, connected_devices, low_on_timer, low_off_timer
 
     current_power = smoothed_power(reading["powerWatt"])
     now = utime.time()
     delta_power = current_power - last_power_reading
 
-    # --- Detect Candidate ---
-    if (abs(delta_power) > POWER_CHANGE_THRESHOLD_WATT) and (not debounce_active):
+    # --- High-load detection ---
+    if abs(delta_power) > 0.3 and not debounce_active:
         debounce_active = True
         debounce_start_time = now
         debounce_event_type = "ON" if delta_power > 0 else "OFF"
-        print("⚡ Power change candidate:", debounce_event_type, "(ΔP={:.1f} W)".format(delta_power))
+        print("⚡ Power change candidate:", debounce_event_type, "(ΔP={:.2f} W)".format(delta_power))
 
-    # --- Confirm Event ---
     if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
-        if debounce_event_type == "ON" and current_power < POWER_MIN_VALID_WATT:
-            # PATCH: accept low-watt ON if step is significant
-            delta_est = current_power - last_power_reading
-            if delta_est < MIN_RESIDUAL_WATT:
-                print("❌ Ignored tiny ON step ({:.2f} W)".format(delta_est))
-                debounce_active = False
-                debounce_event_type = None
-                return
-            else:
-                print("⚠️ Low-watt ON accepted (ΔP={:.1f} W)".format(delta_est))
-
-        # --- Baseline Snapshot ---
-        if len(power_window) >= 3:
-            pre_total = sum(power_window[:-2]) / max(len(power_window[:-2]), 1)
+        if debounce_event_type == "ON" and current_power < 0.5:
+            debounce_active = False
+            debounce_event_type = None
         else:
             pre_total = last_power_reading
+            active_events.append({
+                "event_type": debounce_event_type,
+                "start_time": now,
+                "pre_total": pre_total,
+                "transient_buffer": [],
+                "buffer": [],
+                "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
+                "finalized": False
+            })
+            print("✅ Confirmed event:", debounce_event_type, "pre_total={:.2f}W".format(pre_total))
+            debounce_active = False
+            debounce_event_type = None
 
-        event = {
-            "event_type": debounce_event_type,
-            "start_time": now,
-            "pre_total": pre_total,
-            "transient_buffer": [],
-            "buffer": [],
-            "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
-            "finalized": False
-        }
-        active_events.append(event)
-        print("✅ Confirmed event:", debounce_event_type, "pre_total={:.1f}W".format(pre_total))
+    # --- Low-power ON watcher ---
+    LOW_POWER_ON_THRESHOLD = 2.0   # watts
+    LOW_POWER_SUSTAIN_SECONDS = 3  # seconds
 
-        debounce_active = False
-        debounce_event_type = None
+    if last_power_reading < 0.8 and current_power >= LOW_POWER_ON_THRESHOLD:
+        if low_on_timer is None:
+            low_on_timer = now
+        elif now - low_on_timer >= LOW_POWER_SUSTAIN_SECONDS:
+            print("🌿 Detected low-power appliance ON (~{:.1f} W)".format(current_power))
+            sig_point = {
+                "timestamp": reading["timestamp"],
+                "voltageVolt": reading["voltageVolt"],
+                "currentAmp": reading["currentAmp"],
+                "powerWatt": round(current_power, 1),
+                "powerFactor": reading["powerFactor"]
+            }
+            event_signature = {
+                "dataType": "ApplianceSignature",
+                "deviceId": device_id,
+                "event_type": "ON",
+                "signature_data": [sig_point],
+                "timestamp": now,
+                "features": {
+                    "steady_avg_power": sig_point["powerWatt"],
+                    "powerFactor": sig_point["powerFactor"]
+                }
+            }
 
-    # --- Process Active Events ---
-    for event in list(active_events):
-        if now - event["start_time"] <= TRANSIENT_CAPTURE_WINDOW:
-            event["transient_buffer"].append(reading)
-        event["buffer"].append(reading)
-
-        if not event["finalized"] and now >= event["stabilization_time"]:
-            if not event["buffer"]:
-                active_events.remove(event)
-                continue
-
-            stable_power = sum(x["powerWatt"] for x in event["buffer"]) / len(event["buffer"])
-            variation = max(x["powerWatt"] for x in event["buffer"]) - min(x["powerWatt"] for x in event["buffer"])
-
-            # PATCH: accept small stable variations as valid low-power device
-            if stable_power < 10.0 and variation < 3.0:
-                print("🌿 Low-power device detected — accepting steady {:.1f} W".format(stable_power))
-                variation = STABILIZATION_VARIATION_WATT / 2
-
-            # Force finalize for heavy transient loads
-            if variation > STABILIZATION_VARIATION_WATT and len(event["buffer"]) > APPLIANCE_STABILIZATION_WINDOW * 2:
-                print("⚠️ Large variation persisted; forcing finalize.")
-                variation = STABILIZATION_VARIATION_WATT / 2
-
-            if variation <= STABILIZATION_VARIATION_WATT:
-                pre = event.get("pre_total", last_power_reading)
-                residual = stable_power - pre
-                rel = (residual / pre) if pre > 0 else 0.0
-
-                if residual >= MIN_RESIDUAL_WATT or rel >= MIN_RESIDUAL_RELATIVE:
-                    sig_point = {
-                        "timestamp": event["buffer"][-1]["timestamp"],
-                        "voltageVolt": event["buffer"][-1]["voltageVolt"],
-                        "currentAmp": event["buffer"][-1]["currentAmp"],
-                        "powerWatt": round(residual, 1),
-                        "powerFactor": event["buffer"][-1]["powerFactor"]
+            result = send_signature_to_cloud(event_signature, low_power=True)
+            if result:
+                appliance_id = result.get("applianceID")
+                appliance_name = result.get("applianceName", "Unknown")
+                if appliance_id:
+                    connected_devices[appliance_id] = {
+                        "name": appliance_name,
+                        "powerWatt": sig_point["powerWatt"],
+                        "powerFactor": sig_point["powerFactor"],
+                        "last_seen": now
                     }
-
-                    event_signature = {
-                        "dataType": "ApplianceSignature",
-                        "deviceId": device_id,
-                        "event_type": event["event_type"],
-                        "signature_data": [sig_point],
-                        "timestamp": now,
-                        "features": {
-                            "steady_avg_power": sig_point["powerWatt"],
-                            "powerFactor": sig_point["powerFactor"]
-                        }
-                    }
-
-                    # --- Send to Cloud ---
-                    try:
-                        print("📡 Sending signature to:", CLOUD_FUNCTION_URL_SIGNATURE)
-                        resp = urequests.post(
-                            CLOUD_FUNCTION_URL_SIGNATURE,
-                            data=json.dumps(event_signature),
-                            headers={"Content-Type": "application/json"}
-                        )
-                        try:
-                            result = resp.json()
-                        except Exception:
-                            print("⚠️ Cloud returned non-JSON response:", resp.text)
-                            result = {}
-                        resp.close()
-
-                        appliance_id = result.get("applianceID")
-                        appliance_name = result.get("applianceName", "Unknown")
-                        match_score = result.get("matchScore")
-
-                        if match_score is not None:
-                            confidence = (1 - float(match_score)) * 100
-                            print("🤖 Match score:", round(float(match_score), 3),
-                                  "→ Confidence:", round(confidence, 1), "%")
-                        else:
-                            print("✨ New appliance registered in cloud (no previous match).")
-
-                        if appliance_id:
-                            connected_devices[appliance_id] = {
-                                "name": appliance_name,
-                                "powerWatt": sig_point["powerWatt"],
-                                "powerFactor": sig_point["powerFactor"],
-                                "last_seen": now
-                            }
-                            print("🔌 Device connected:", appliance_name, f"({appliance_id})")
-                            print(f"⚙️  Power: {sig_point['powerWatt']}W | PF: {sig_point['powerFactor']:.2f}")
-                            print("📊 Devices connected:", len(connected_devices))
-                            print_connected_devices()
-
-                    except Exception as e:
-                        print("❌ Failed to send signature:", e)
+                    print("🔌 Low-power device connected:", appliance_name, f"({appliance_id})")
+                    print_connected_devices()
                 else:
-                    print("⚠️ Residual {:.2f} W (rel {:.2f}) below threshold; ignored.".format(residual, rel))
-
+                    print("⚠️ No appliance ID returned; cloud may have rejected signature.")
             else:
-                print("⚠️ Event discarded: unstable variation {:.1f} W".format(variation))
+                print("⚠️ Signature send failed or invalid cloud response.")
+
+            low_on_timer = None
+    else:
+        low_on_timer = None
+
+    # --- Low-power OFF watcher ---
+    total_connected_power = sum(d.get("powerWatt", 0) for d in connected_devices.values())
+    if total_connected_power > 0 and current_power < 1.0:
+        if low_off_timer is None:
+            low_off_timer = now
+        elif now - low_off_timer > 5:
+            print("🍃 Low-power devices turned off (current {:.1f}W) → clearing registry".format(current_power))
+            connected_devices.clear()
+            print_connected_devices()
+            low_off_timer = None
+    else:
+        low_off_timer = None
+
+    # --- Finalize active events ---
+    for event in list(active_events):
+        if now >= event["stabilization_time"] and not event["finalized"]:
+            # Compute average stable power
+            stable_power = current_power
+            residual = stable_power - event["pre_total"]
+
+            if residual >= MIN_RESIDUAL_WATT:
+                sig_point = {
+                    "timestamp": reading["timestamp"],
+                    "voltageVolt": reading["voltageVolt"],
+                    "currentAmp": reading["currentAmp"],
+                    "powerWatt": round(residual, 1),
+                    "powerFactor": reading["powerFactor"]
+                }
+
+                event_signature = {
+                    "dataType": "ApplianceSignature",
+                    "deviceId": device_id,
+                    "event_type": event["event_type"],
+                    "signature_data": [sig_point],
+                    "timestamp": now,
+                    "features": {
+                        "steady_avg_power": sig_point["powerWatt"],
+                        "powerFactor": sig_point["powerFactor"]
+                    }
+                }
+
+                try:
+                    print("📡 Sending signature to:", CLOUD_FUNCTION_URL_SIGNATURE)
+                    resp = urequests.post(
+                        CLOUD_FUNCTION_URL_SIGNATURE,
+                        data=json.dumps(event_signature),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    raw_resp = resp.text
+                    print("☁️ Raw cloud response:", raw_resp)
+                    try:
+                        result = json.loads(raw_resp)
+                    except Exception:
+                        print("⚠️ Cloud returned invalid JSON")
+                        result = {}
+                    resp.close()
+
+                    appliance_id = result.get("applianceID")
+                    appliance_name = result.get("applianceName", "Unknown")
+
+                    if appliance_id:
+                        connected_devices[appliance_id] = {
+                            "name": appliance_name,
+                            "powerWatt": sig_point["powerWatt"],
+                            "powerFactor": sig_point["powerFactor"],
+                            "last_seen": now
+                        }
+                        print("🔌 Device connected:", appliance_name, f"({appliance_id})")
+                        print_connected_devices()
+                    else:
+                        print("⚠️ No appliance ID returned; cloud may have rejected signature.")
+                except Exception as e:
+                    print("❌ Failed to send signature:", e)
 
             event["finalized"] = True
             try:
@@ -381,3 +400,4 @@ while True:
     except Exception as loop_err:
         print("Loop error:", loop_err)
         time.sleep(5)
+    
