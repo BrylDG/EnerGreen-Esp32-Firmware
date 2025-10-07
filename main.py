@@ -1,6 +1,8 @@
 # main.py - EnerGreen ESP32 MicroPython Code with Appliance Signature Detection + Residual Disaggregation
-# PATCHED (Heavy Load Fix): improved pre-event snapshot, relaxed stabilization tolerance,
-# added forced finalize for long transients, and widened smoothing buffer.
+# PATCHED (Low-Wattage Fix + Heavy Load Fix)
+#  • Detects low-wattage devices (≥ 5 W)
+#  • Keeps robustness for heavy appliances
+#  • Adds low-power steady-state acceptance
 
 import time
 import random
@@ -14,16 +16,15 @@ from machine import UART
 # --- Configuration ---
 USE_SIMULATED_DATA = False
 POWER_CHANGE_THRESHOLD_WATT = 1.5
-POWER_MIN_VALID_WATT = 2.0
+POWER_MIN_VALID_WATT = 0.5          # PATCH ↓ from 2.0 → detect small fans
 POWER_CHANGE_DEBOUNCE_SECONDS = 3
 REGULAR_READING_INTERVAL_SECONDS = 60
 
-# PATCH: relaxed and tuned thresholds
 APPLIANCE_STABILIZATION_WINDOW = 8
-STABILIZATION_VARIATION_WATT = 80.0     # <-- was 5.0, now allows heavy-load variation
+STABILIZATION_VARIATION_WATT = 80.0
 TRANSIENT_CAPTURE_WINDOW = 5
 MIN_RESIDUAL_WATT = 0.5
-MIN_RESIDUAL_RELATIVE = 0.03
+MIN_RESIDUAL_RELATIVE = 0.02        # PATCH ↓ from 0.03
 
 # --- Cloud & Wi-Fi config ---
 try:
@@ -51,9 +52,8 @@ debounce_event_type = None
 active_events = []
 connected_devices = {}
 
-# PATCH: expanded smoothing buffer
 power_window = []
-POWER_WINDOW_SIZE = 8  # was 5
+POWER_WINDOW_SIZE = 8  # PATCH ↑ wider smoothing buffer
 
 # UART to PZEM
 pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=1000)
@@ -195,25 +195,33 @@ def detect_appliance_event(reading):
     # --- Confirm Event ---
     if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
         if debounce_event_type == "ON" and current_power < POWER_MIN_VALID_WATT:
-            print("❌ Ignored false ON ({:.1f} W)".format(current_power))
-        else:
-            # PATCH: better baseline snapshot (pre-event average)
-            if len(power_window) >= 3:
-                pre_total = sum(power_window[:-2]) / max(len(power_window[:-2]), 1)
+            # PATCH: accept low-watt ON if step is significant
+            delta_est = current_power - last_power_reading
+            if delta_est < MIN_RESIDUAL_WATT:
+                print("❌ Ignored tiny ON step ({:.2f} W)".format(delta_est))
+                debounce_active = False
+                debounce_event_type = None
+                return
             else:
-                pre_total = last_power_reading
+                print("⚠️ Low-watt ON accepted (ΔP={:.1f} W)".format(delta_est))
 
-            event = {
-                "event_type": debounce_event_type,
-                "start_time": now,
-                "pre_total": pre_total,  # more stable baseline
-                "transient_buffer": [],
-                "buffer": [],
-                "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
-                "finalized": False
-            }
-            active_events.append(event)
-            print("✅ Confirmed event:", debounce_event_type, "pre_total={:.1f}W".format(pre_total))
+        # --- Baseline Snapshot ---
+        if len(power_window) >= 3:
+            pre_total = sum(power_window[:-2]) / max(len(power_window[:-2]), 1)
+        else:
+            pre_total = last_power_reading
+
+        event = {
+            "event_type": debounce_event_type,
+            "start_time": now,
+            "pre_total": pre_total,
+            "transient_buffer": [],
+            "buffer": [],
+            "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
+            "finalized": False
+        }
+        active_events.append(event)
+        print("✅ Confirmed event:", debounce_event_type, "pre_total={:.1f}W".format(pre_total))
 
         debounce_active = False
         debounce_event_type = None
@@ -232,9 +240,14 @@ def detect_appliance_event(reading):
             stable_power = sum(x["powerWatt"] for x in event["buffer"]) / len(event["buffer"])
             variation = max(x["powerWatt"] for x in event["buffer"]) - min(x["powerWatt"] for x in event["buffer"])
 
-            # PATCH: allow large transient loads to finalize
+            # PATCH: accept small stable variations as valid low-power device
+            if stable_power < 10.0 and variation < 3.0:
+                print("🌿 Low-power device detected — accepting steady {:.1f} W".format(stable_power))
+                variation = STABILIZATION_VARIATION_WATT / 2
+
+            # Force finalize for heavy transient loads
             if variation > STABILIZATION_VARIATION_WATT and len(event["buffer"]) > APPLIANCE_STABILIZATION_WINDOW * 2:
-                print("⚠️ Large variation persisted; forcing finalize (likely heavy load).")
+                print("⚠️ Large variation persisted; forcing finalize.")
                 variation = STABILIZATION_VARIATION_WATT / 2
 
             if variation <= STABILIZATION_VARIATION_WATT:
@@ -263,7 +276,7 @@ def detect_appliance_event(reading):
                         }
                     }
 
-                    # --- Send signature to Cloud Function ---
+                    # --- Send to Cloud ---
                     try:
                         print("📡 Sending signature to:", CLOUD_FUNCTION_URL_SIGNATURE)
                         resp = urequests.post(
@@ -271,21 +284,17 @@ def detect_appliance_event(reading):
                             data=json.dumps(event_signature),
                             headers={"Content-Type": "application/json"}
                         )
-
                         try:
                             result = resp.json()
                         except Exception:
                             print("⚠️ Cloud returned non-JSON response:", resp.text)
                             result = {}
-
                         resp.close()
 
-                        # --- Extract results ---
                         appliance_id = result.get("applianceID")
                         appliance_name = result.get("applianceName", "Unknown")
                         match_score = result.get("matchScore")
 
-                        # --- Interpret match confidence ---
                         if match_score is not None:
                             confidence = (1 - float(match_score)) * 100
                             print("🤖 Match score:", round(float(match_score), 3),
@@ -293,7 +302,6 @@ def detect_appliance_event(reading):
                         else:
                             print("✨ New appliance registered in cloud (no previous match).")
 
-                        # --- Register device locally ---
                         if appliance_id:
                             connected_devices[appliance_id] = {
                                 "name": appliance_name,
@@ -301,18 +309,15 @@ def detect_appliance_event(reading):
                                 "powerFactor": sig_point["powerFactor"],
                                 "last_seen": now
                             }
-
                             print("🔌 Device connected:", appliance_name, f"({appliance_id})")
                             print(f"⚙️  Power: {sig_point['powerWatt']}W | PF: {sig_point['powerFactor']:.2f}")
                             print("📊 Devices connected:", len(connected_devices))
                             print_connected_devices()
-                        else:
-                            print("⚠️ No appliance ID returned; cloud may have rejected signature.")
 
                     except Exception as e:
                         print("❌ Failed to send signature:", e)
                 else:
-                    print("⚠️ Residual {:.2f}W (rel {:.2f}) below threshold; ignored.".format(residual, rel))
+                    print("⚠️ Residual {:.2f} W (rel {:.2f}) below threshold; ignored.".format(residual, rel))
 
             else:
                 print("⚠️ Event discarded: unstable variation {:.1f} W".format(variation))
@@ -360,7 +365,8 @@ while True:
                 if "deviceId" not in payload:
                     payload["deviceId"] = device_id
                 try:
-                    resp = urequests.post(CLOUD_FUNCTION_URL_READING, data=json.dumps(payload),
+                    resp = urequests.post(CLOUD_FUNCTION_URL_READING,
+                                          data=json.dumps(payload),
                                           headers={"Content-Type": "application/json"})
                     print("☁️ Readings response:", resp.text)
                     resp.close()
