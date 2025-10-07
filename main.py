@@ -1,32 +1,32 @@
-# main.py - EnerGreen ESP32 MicroPython Code with Appliance Signature Detection + Residual Disaggregation
-# PATCHED (Low-Wattage Fix + Heavy Load Fix + Timer Scope Fix)
-#  • Detects low-wattage devices (≥ 5 W)
-#  • Handles heavy loads robustly
-#  • Uses global timers for low-power detection (fixes '_low_on_timer' errors)
+# main.py – EnerGreen ESP32 Firmware (Unified Multi-Appliance + Low-Wattage + Heavy-Load Support)
+# ------------------------------------------------------------------------------
+#  ✅ Detects multiple appliances concurrently
+#  ✅ Detects OFF events by matching power drops
+#  ✅ Supports low-wattage devices (≥ 2 W)
+#  ✅ Keeps heavy-load stability and transient analysis
+# ------------------------------------------------------------------------------
 
-import time
-import random
-import network
-import urequests
-import json
-import utime
-import ntptime
+import time, json, utime, random, network, urequests, ntptimex
 from machine import UART
 
-# --- Configuration ---
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
 USE_SIMULATED_DATA = False
-POWER_CHANGE_THRESHOLD_WATT = 1.5
-POWER_MIN_VALID_WATT = 0.5          # Detects small fans, chargers, etc.
+POWER_CHANGE_THRESHOLD_WATT = 1.2     # sensitivity for ON/OFF event candidates
+POWER_MIN_VALID_WATT = 0.5            # discard noise
 POWER_CHANGE_DEBOUNCE_SECONDS = 3
 REGULAR_READING_INTERVAL_SECONDS = 60
 
 APPLIANCE_STABILIZATION_WINDOW = 8
-STABILIZATION_VARIATION_WATT = 80.0
+STABILIZATION_VARIATION_WATT = 60.0   # heavy load tolerance
 TRANSIENT_CAPTURE_WINDOW = 5
 MIN_RESIDUAL_WATT = 0.5
 MIN_RESIDUAL_RELATIVE = 0.02
 
-# --- Cloud & Wi-Fi config ---
+# ------------------------------------------------------------------------------
+# Cloud configuration
+# ------------------------------------------------------------------------------
 try:
     from config import (
         CLOUD_FUNCTION_URL_READING,
@@ -35,369 +35,291 @@ try:
         WIFI_PASSWORD
     )
 except ImportError:
-    print("Error: config.py missing. Using defaults.")
-    CLOUD_FUNCTION_URL_READING = 'http://default_readings_url'
-    CLOUD_FUNCTION_URL_SIGNATURE = 'http://default_signatures_url'
-    WIFI_SSID = 'default_ssid'
-    WIFI_PASSWORD = 'default_password'
+    print("⚠️ config.py missing; using defaults.")
+    CLOUD_FUNCTION_URL_READING = "http://default_reading_url"
+    CLOUD_FUNCTION_URL_SIGNATURE = "http://default_signature_url"
+    WIFI_SSID, WIFI_PASSWORD = "ssid", "password"
 
-# --- Globals ---
-device_id = "energreen_esp32_002"
+# ------------------------------------------------------------------------------
+# Globals
+# ------------------------------------------------------------------------------
+device_id = "energreen_esp32"
 last_power_reading = 0.0
 last_regular_reading_time = 0
 debounce_active = False
 debounce_start_time = 0
 debounce_event_type = None
 
-active_events = []
-connected_devices = {}
+active_events = []         # pending ON/OFF transitions
+connected_devices = {}     # applianceID → info dict
 
 power_window = []
-POWER_WINDOW_SIZE = 8  # widened smoothing buffer
-
-# NEW: low-power detection timers
+POWER_WINDOW_SIZE = 8
 low_on_timer = None
 low_off_timer = None
 
-# UART to PZEM
+# UART for PZEM
 pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=1000)
 
-
-# ----------------- Helpers -----------------
+# ------------------------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------------------------
 def smoothed_power(new_reading):
-    global power_window
     power_window.append(new_reading)
     if len(power_window) > POWER_WINDOW_SIZE:
         power_window.pop(0)
     return sum(power_window) / len(power_window)
-
 
 def modbus_crc16(data):
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if crc & 0x0001:
-                crc >>= 1
-                crc ^= 0xA001
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
             else:
                 crc >>= 1
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
-
-def sync_time_with_ntp(max_retries=10, timeout=5):
-    ntptime.host = 'pool.ntp.org'
-    for i in range(max_retries):
+def sync_time_with_ntp():
+    for i in range(5):
         try:
             ntptime.settime()
             print("NTP synced:", utime.localtime())
             return True
-        except Exception as e:
-            print("NTP attempt", i + 1, "failed:", e)
-            time.sleep(timeout)
-    print("NTP failed after retries")
+        except Exception:
+            time.sleep(2)
+    print("⚠️ NTP failed.")
     return False
 
-
-def print_reading(reading):
-    print("[Reading] {v:.1f} V | {c:.3f} A | {p:.1f} W | PF {pf:.2f} | kWh {k:.3f}".format(
-        v=reading["voltageVolt"],
-        c=reading["currentAmp"],
-        p=reading["powerWatt"],
-        pf=reading["powerFactor"],
-        k=reading["kwhConsumed"]
-    ))
-    print_connected_devices()
-
-
-def list_connected_devices():
-    if not connected_devices:
-        return []
-    return [f"{info.get('name', 'Unknown')} ({aid}) - {info.get('powerWatt', 0)}W"
-            for aid, info in connected_devices.items()]
-
-
 def print_connected_devices():
-    devices = list_connected_devices()
-    if devices:
-        print("➡️ Connected devices:", devices)
+    if connected_devices:
+        print("➡️ Connected devices:",
+              [f"{v['name']} ({k}) - {v['powerWatt']}W" for k, v in connected_devices.items()])
     else:
         print("➡️ No devices connected.")
 
-
-# ----------------- PZEM read -----------------
+# ------------------------------------------------------------------------------
+# PZEM reading
+# ------------------------------------------------------------------------------
 def pzem_data():
     try:
         _ = pzem_uart.read()
         time.sleep_ms(50)
-
-        base_cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
-        crc = modbus_crc16(base_cmd)
-        cmd = base_cmd + crc
+        cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
+        cmd += modbus_crc16(cmd)
         pzem_uart.write(cmd)
-        time.sleep_ms(500)
-
-        response = pzem_uart.read()
-        if not response or len(response) < 21:
-            return None
-
-        data = response[3:3 + 20]
-        if len(data) < 20:
-            return None
-
-        def u32_from_low_high(payload, offset):
-            low16 = int.from_bytes(payload[offset:offset + 2], 'big')
-            high16 = int.from_bytes(payload[offset + 2:offset + 4], 'big')
-            return (high16 << 16) | low16
-
-        voltage = int.from_bytes(data[0:2], 'big') / 10.0
-        current_raw = u32_from_low_high(data, 2)
-        power_raw = u32_from_low_high(data, 6)
-        energy_raw = u32_from_low_high(data, 10)
-        frequency = int.from_bytes(data[14:16], 'big') / 10.0
-        pf = int.from_bytes(data[16:18], 'big') / 100.0
-
-        current = current_raw / 1000.0
-        power = power_raw / 10.0
-        energy_kwh = energy_raw / 1000.0
-
-        if not (0.0 <= voltage <= 300.0): return None
-        if not (0.0 <= current <= 200.0): return None
-        if not (-10000.0 <= power <= 10000.0): return None
-
+        time.sleep_ms(400)
+        res = pzem_uart.read()
+        if not res or len(res) < 21: return None
+        data = res[3:23]
+        def u32(payload, offset):
+            low = int.from_bytes(payload[offset:offset+2],'big')
+            high = int.from_bytes(payload[offset+2:offset+4],'big')
+            return (high<<16)|low
+        voltage = int.from_bytes(data[0:2],'big')/10
+        current = u32(data,2)/1000
+        power = u32(data,6)/10
+        pf = int.from_bytes(data[16:18],'big')/100
+        energy = u32(data,10)/1000
         return {
-            "deviceId": device_id,
-            "timestamp": utime.time(),
-            "voltageVolt": round(voltage, 1),
-            "currentAmp": round(current, 3),
-            "powerWatt": round(power, 1),
-            "kwhConsumed": round(energy_kwh, 3),
-            "frequencyHz": round(frequency, 1),
-            "powerFactor": round(pf, 2),
-            "energySource": "Grid"
+            "deviceId":device_id,
+            "timestamp":utime.time(),
+            "voltageVolt":round(voltage,1),
+            "currentAmp":round(current,3),
+            "powerWatt":round(power,1),
+            "kwhConsumed":round(energy,3),
+            "powerFactor":round(pf,2),
         }
-
     except Exception as e:
-        print("Error in pzem_data:", e)
+        print("Error PZEM:", e)
         return None
 
+# ------------------------------------------------------------------------------
+# Cloud helper
+# ------------------------------------------------------------------------------
+def send_signature_to_cloud(sig):
+    try:
+        print("📡 Sending signature to cloud...")
+        resp = urequests.post(CLOUD_FUNCTION_URL_SIGNATURE,
+                              data=json.dumps(sig),
+                              headers={"Content-Type": "application/json"})
+        raw = resp.text
+        print("☁️ Cloud response:", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        resp.close()
+        return data
+    except Exception as e:
+        print("❌ Cloud send error:", e)
+        return {}
 
-# ----------------- Event Detection -----------------
+# ------------------------------------------------------------------------------
+# Event detection
+# ------------------------------------------------------------------------------
+def find_best_match_for_drop(drop_watt):
+    """Find the connected device whose power roughly matches the observed drop."""
+    if not connected_devices:
+        return None
+    best_id, best_diff = None, 1e9
+    for aid, info in connected_devices.items():
+        diff = abs(info.get("powerWatt",0)-drop_watt)
+        if diff < best_diff:
+            best_diff, best_id = diff, aid
+    if best_id and best_diff <= max(10,0.4*connected_devices[best_id]['powerWatt']):
+        return best_id
+    return None
+
 def detect_appliance_event(reading):
     global last_power_reading, debounce_active, debounce_start_time, debounce_event_type
     global active_events, connected_devices, low_on_timer, low_off_timer
 
     current_power = smoothed_power(reading["powerWatt"])
     now = utime.time()
-    delta_power = current_power - last_power_reading
+    delta = current_power - last_power_reading
 
-    # --- High-load detection ---
-    if abs(delta_power) > 0.3 and not debounce_active:
+    # --- Candidate event ---
+    if abs(delta) > POWER_CHANGE_THRESHOLD_WATT and not debounce_active:
         debounce_active = True
         debounce_start_time = now
-        debounce_event_type = "ON" if delta_power > 0 else "OFF"
-        print("⚡ Power change candidate:", debounce_event_type, "(ΔP={:.2f} W)".format(delta_power))
+        debounce_event_type = "ON" if delta > 0 else "OFF"
+        pre_snapshot = last_power_reading
+        print(f"⚡ Candidate {debounce_event_type} ΔP={delta:.1f}W")
 
+    # --- Confirm event ---
     if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
-        if debounce_event_type == "ON" and current_power < 0.5:
-            debounce_active = False
-            debounce_event_type = None
-        else:
-            pre_total = last_power_reading
-            active_events.append({
-                "event_type": debounce_event_type,
-                "start_time": now,
-                "pre_total": pre_total,
-                "transient_buffer": [],
-                "buffer": [],
-                "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
-                "finalized": False
-            })
-            print("✅ Confirmed event:", debounce_event_type, "pre_total={:.2f}W".format(pre_total))
-            debounce_active = False
-            debounce_event_type = None
+        event = {
+            "event_type": debounce_event_type,
+            "start_time": now,
+            "pre_total": last_power_reading,
+            "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
+            "finalized": False
+        }
+        active_events.append(event)
+        print(f"✅ Confirmed {debounce_event_type} pre_total={last_power_reading:.1f}W")
+        debounce_active = False
+        debounce_event_type = None
 
-    # --- Low-power ON watcher ---
-    LOW_POWER_ON_THRESHOLD = 2.0   # watts
-    LOW_POWER_SUSTAIN_SECONDS = 3  # seconds
-
-    if last_power_reading < 0.8 and current_power >= LOW_POWER_ON_THRESHOLD:
+    # --- Low-power ON watcher (e.g. clip fan) ---
+    if last_power_reading < 1.0 and current_power > 2.0:
         if low_on_timer is None:
             low_on_timer = now
-        elif now - low_on_timer >= LOW_POWER_SUSTAIN_SECONDS:
-            print("🌿 Detected low-power appliance ON (~{:.1f} W)".format(current_power))
-            sig_point = {
-                "timestamp": reading["timestamp"],
-                "voltageVolt": reading["voltageVolt"],
-                "currentAmp": reading["currentAmp"],
-                "powerWatt": round(current_power, 1),
-                "powerFactor": reading["powerFactor"]
-            }
-            event_signature = {
+        elif now - low_on_timer > 3:
+            print(f"🌿 Low-power ON detected ({current_power:.1f}W)")
+            sig = {
                 "dataType": "ApplianceSignature",
                 "deviceId": device_id,
                 "event_type": "ON",
-                "signature_data": [sig_point],
-                "timestamp": now,
+                "signature_data": [{
+                    "timestamp": reading["timestamp"],
+                    "powerWatt": round(current_power,1),
+                    "powerFactor": reading["powerFactor"]
+                }],
                 "features": {
-                    "steady_avg_power": sig_point["powerWatt"],
-                    "powerFactor": sig_point["powerFactor"]
+                    "steady_avg_power": round(current_power,1),
+                    "powerFactor": reading["powerFactor"]
                 }
             }
-
-            result = send_signature_to_cloud(event_signature, low_power=True)
-            if result:
-                appliance_id = result.get("applianceID")
-                appliance_name = result.get("applianceName", "Unknown")
-                if appliance_id:
-                    connected_devices[appliance_id] = {
-                        "name": appliance_name,
-                        "powerWatt": sig_point["powerWatt"],
-                        "powerFactor": sig_point["powerFactor"],
-                        "last_seen": now
-                    }
-                    print("🔌 Low-power device connected:", appliance_name, f"({appliance_id})")
-                    print_connected_devices()
-                else:
-                    print("⚠️ No appliance ID returned; cloud may have rejected signature.")
-            else:
-                print("⚠️ Signature send failed or invalid cloud response.")
-
+            res = send_signature_to_cloud(sig)
+            if res.get("applianceID"):
+                aid = res["applianceID"]
+                connected_devices[aid] = {
+                    "name": res.get("applianceName","Unknown"),
+                    "powerWatt": sig["features"]["steady_avg_power"],
+                    "powerFactor": sig["features"]["powerFactor"],
+                    "last_seen": now
+                }
+                print("🔌 Device connected:", connected_devices[aid]["name"])
             low_on_timer = None
     else:
         low_on_timer = None
 
-    # --- Low-power OFF watcher ---
-    total_connected_power = sum(d.get("powerWatt", 0) for d in connected_devices.values())
-    if total_connected_power > 0 and current_power < 1.0:
-        if low_off_timer is None:
-            low_off_timer = now
-        elif now - low_off_timer > 5:
-            print("🍃 Low-power devices turned off (current {:.1f}W) → clearing registry".format(current_power))
-            connected_devices.clear()
-            print_connected_devices()
-            low_off_timer = None
-    else:
-        low_off_timer = None
-
-    # --- Finalize active events ---
-    for event in list(active_events):
-        if now >= event["stabilization_time"] and not event["finalized"]:
-            # Compute average stable power
-            stable_power = current_power
-            residual = stable_power - event["pre_total"]
-
-            if residual >= MIN_RESIDUAL_WATT:
-                sig_point = {
-                    "timestamp": reading["timestamp"],
-                    "voltageVolt": reading["voltageVolt"],
-                    "currentAmp": reading["currentAmp"],
-                    "powerWatt": round(residual, 1),
-                    "powerFactor": reading["powerFactor"]
-                }
-
-                event_signature = {
+    # --- Process active events (multi-appliance logic) ---
+    for ev in list(active_events):
+        if now >= ev["stabilization_time"] and not ev["finalized"]:
+            residual = current_power - ev["pre_total"]
+            if ev["event_type"] == "ON" and residual >= MIN_RESIDUAL_WATT:
+                sig = {
                     "dataType": "ApplianceSignature",
                     "deviceId": device_id,
-                    "event_type": event["event_type"],
-                    "signature_data": [sig_point],
-                    "timestamp": now,
+                    "event_type": "ON",
+                    "signature_data": [{
+                        "timestamp": reading["timestamp"],
+                        "powerWatt": round(residual,1),
+                        "powerFactor": reading["powerFactor"]
+                    }],
                     "features": {
-                        "steady_avg_power": sig_point["powerWatt"],
-                        "powerFactor": sig_point["powerFactor"]
+                        "steady_avg_power": round(residual,1),
+                        "powerFactor": reading["powerFactor"]
                     }
                 }
+                res = send_signature_to_cloud(sig)
+                if res.get("applianceID"):
+                    aid = res["applianceID"]
+                    connected_devices[aid] = {
+                        "name": res.get("applianceName","Unknown"),
+                        "powerWatt": sig["features"]["steady_avg_power"],
+                        "powerFactor": sig["features"]["powerFactor"],
+                        "last_seen": now
+                    }
+                    print(f"🔌 Device connected: {connected_devices[aid]['name']} ({aid})")
+                    print_connected_devices()
 
-                try:
-                    print("📡 Sending signature to:", CLOUD_FUNCTION_URL_SIGNATURE)
-                    resp = urequests.post(
-                        CLOUD_FUNCTION_URL_SIGNATURE,
-                        data=json.dumps(event_signature),
-                        headers={"Content-Type": "application/json"}
-                    )
-                    raw_resp = resp.text
-                    print("☁️ Raw cloud response:", raw_resp)
-                    try:
-                        result = json.loads(raw_resp)
-                    except Exception:
-                        print("⚠️ Cloud returned invalid JSON")
-                        result = {}
-                    resp.close()
-
-                    appliance_id = result.get("applianceID")
-                    appliance_name = result.get("applianceName", "Unknown")
-
-                    if appliance_id:
-                        connected_devices[appliance_id] = {
-                            "name": appliance_name,
-                            "powerWatt": sig_point["powerWatt"],
-                            "powerFactor": sig_point["powerFactor"],
-                            "last_seen": now
-                        }
-                        print("🔌 Device connected:", appliance_name, f"({appliance_id})")
+            elif ev["event_type"] == "OFF":
+                drop = ev["pre_total"] - current_power
+                if drop > 0:
+                    match = find_best_match_for_drop(drop)
+                    if match:
+                        info = connected_devices.pop(match)
+                        print(f"❌ Device disconnected: {info['name']} ({match})")
                         print_connected_devices()
-                    else:
-                        print("⚠️ No appliance ID returned; cloud may have rejected signature.")
-                except Exception as e:
-                    print("❌ Failed to send signature:", e)
-
-            event["finalized"] = True
-            try:
-                active_events.remove(event)
-            except ValueError:
-                pass
+            ev["finalized"] = True
+            active_events.remove(ev)
 
     last_power_reading = current_power
 
-
-# ----------------- Wi-Fi connect -----------------
-sta_if = network.WLAN(network.STA_IF)
+# ------------------------------------------------------------------------------
+# Wi-Fi connection
+# ------------------------------------------------------------------------------
+sta = network.WLAN(network.STA_IF)
 print("Connecting to Wi-Fi...")
-sta_if.active(True)
-sta_if.connect(WIFI_SSID, WIFI_PASSWORD)
-timeout = 0
-while not sta_if.isconnected() and timeout < 30:
-    print('.', end='')
-    time.sleep(1)
-    timeout += 1
-
-if sta_if.isconnected():
-    print("\nWi-Fi connected:", sta_if.ifconfig())
+sta.active(True)
+sta.connect(WIFI_SSID, WIFI_PASSWORD)
+for _ in range(30):
+    if sta.isconnected(): break
+    print(".", end=""); time.sleep(1)
+if sta.isconnected():
+    print("\n✅ Wi-Fi connected:", sta.ifconfig())
     sync_time_with_ntp()
 else:
-    print("\nWi-Fi connection failed. Check credentials.")
+    print("\n❌ Wi-Fi failed.")
 
-# ----------------- Main loop -----------------
-print("EnerGreen ESP32 Ready. Starting loop...")
+# ------------------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------------------
+print("EnerGreen ready.")
 while True:
     try:
-        reading = pzem_data() if not USE_SIMULATED_DATA else simulate_pzem_data()
-
+        reading = pzem_data() if not USE_SIMULATED_DATA else None
         if reading:
-            print_reading(reading)
+            print(f"[Reading] {reading['powerWatt']:.1f} W | PF {reading['powerFactor']:.2f}")
             detect_appliance_event(reading)
 
             now = utime.time()
             if now - last_regular_reading_time >= REGULAR_READING_INTERVAL_SECONDS:
-                payload = reading.copy()
-                payload["dataType"] = "RegularReading"
-                if "deviceId" not in payload:
-                    payload["deviceId"] = device_id
-                try:
-                    resp = urequests.post(CLOUD_FUNCTION_URL_READING,
-                                          data=json.dumps(payload),
-                                          headers={"Content-Type": "application/json"})
-                    print("☁️ Readings response:", resp.text)
-                    resp.close()
-                    last_regular_reading_time = now
-                except Exception as e:
-                    print("Failed to send reading:", e)
+                reading["dataType"] = "RegularReading"
+                resp = urequests.post(CLOUD_FUNCTION_URL_READING,
+                                      data=json.dumps(reading),
+                                      headers={"Content-Type": "application/json"})
+                print("☁️ Readings response:", resp.text)
+                resp.close()
+                last_regular_reading_time = now
         else:
-            print("No readings")
-
+            print("No reading.")
         time.sleep(1)
-
-    except Exception as loop_err:
-        print("Loop error:", loop_err)
+    except Exception as e:
+        print("Loop error:", e)
         time.sleep(5)
-    
+
