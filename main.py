@@ -6,7 +6,7 @@
 #  ✅ Keeps heavy-load stability and transient analysis
 # ------------------------------------------------------------------------------
 
-import time, json, utime, random, network, urequests, ntptimex
+import time, json, utime, random, network, urequests, ntptime
 from machine import UART
 
 # ------------------------------------------------------------------------------
@@ -322,4 +322,5 @@ while True:
     except Exception as e:
         print("Loop error:", e)
         time.sleep(5)
+
 
