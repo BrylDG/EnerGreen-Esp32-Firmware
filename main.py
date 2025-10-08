@@ -304,7 +304,11 @@ while True:
     try:
         reading = pzem_data() if not USE_SIMULATED_DATA else None
         if reading:
-            print(f"[Reading] {reading['powerWatt']:.1f} W | PF {reading['powerFactor']:.2f}")
+            print(
+                f"[Reading]\n"
+                f"[V]{reading['voltageVolt']:.1f} V || [C]{reading['currentAmp']:.3f} A || [P]{reading['powerWatt']:.1f} W || [E]{reading['kwhConsumed']:.3f} kWh || [PF]{reading['powerFactor']:.2f}\n"
+                "----------------------------------------------------------------"
+            )
             detect_appliance_event(reading)
 
             now = utime.time()
@@ -322,5 +326,4 @@ while True:
     except Exception as e:
         print("Loop error:", e)
         time.sleep(5)
-
 
