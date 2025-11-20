@@ -31,6 +31,7 @@ try:
     from config import (
         CLOUD_FUNCTION_URL_READING,
         CLOUD_FUNCTION_URL_SIGNATURE,
+        CLOUD_FUNCTION_URL_CONNECTEDDEVICES,
         WIFI_SSID,
         WIFI_PASSWORD
     )
@@ -81,16 +82,22 @@ def modbus_crc16(data):
                 crc >>= 1
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
-def sync_time_with_ntp():
-    for i in range(5):
-        try:
-            ntptime.settime()
-            print("NTP synced:", utime.localtime())
-            return True
-        except Exception:
-            time.sleep(2)
-    print("⚠️ NTP failed.")
+def sync_time_with_ntp(max_retries=5):
+    import ntptime, time
+    servers = ['time.google.com', 'time.cloudflare.com', 'pool.ntp.org']
+    for i in range(max_retries):
+        for host in servers:
+            try:
+                ntptime.host = host
+                ntptime.settime()
+                print("✅ NTP synced via", host)
+                return True
+            except Exception as e:
+                print(f"⚠️ Attempt {i+1} failed with {host}: {e}")
+                time.sleep(2)
+    print("❌ All NTP attempts failed.")
     return False
+
 
 def print_connected_devices():
     if connected_devices:
@@ -265,6 +272,8 @@ def detect_appliance_event(reading):
                         "last_seen": now
                     }
                     print(f"🔌 Device connected: {connected_devices[aid]['name']} ({aid})")
+                    connected_devices[aid]["applianceID"] = aid
+                    send_connected_device_to_cloud(connected_devices[aid], "connect")
                     print_connected_devices()
 
             elif ev["event_type"] == "OFF":
@@ -274,11 +283,41 @@ def detect_appliance_event(reading):
                     if match:
                         info = connected_devices.pop(match)
                         print(f"❌ Device disconnected: {info['name']} ({match})")
+                        info["applianceID"] = match
+                        send_connected_device_to_cloud(info, "disconnect")
                         print_connected_devices()
             ev["finalized"] = True
             active_events.remove(ev)
 
     last_power_reading = current_power
+
+# --------------------------------------------------------------------------
+# Connected Devices Cloud Sync
+# --------------------------------------------------------------------------
+def send_connected_device_to_cloud(device_info, action):
+    """
+    Sends connected/disconnected device info to the cloud.
+    action: "connect" or "disconnect"
+    """
+    try:
+        print(f"📤 Sending {action.upper()} event for {device_info.get('name','Unknown')}...")
+        payload = {
+            "deviceId": device_id,
+            "action": action,
+            "applianceID": device_info.get("applianceID", None),
+            "applianceName": device_info.get("name", "Unknown"),
+            "powerWatt": device_info.get("powerWatt", 0),
+            "powerFactor": device_info.get("powerFactor", 0),
+            "timestamp": utime.time()
+        }
+        resp = urequests.post(CLOUD_FUNCTION_URL_CONNECTEDDEVICES,
+                              data=json.dumps(payload),
+                              headers={"Content-Type": "application/json"})
+        print("☁️ ConnectedDevices response:", resp.text)
+        resp.close()
+    except Exception as e:
+        print("❌ Error sending connected device to cloud:", e)
+
 
 # ------------------------------------------------------------------------------
 # Wi-Fi connection
@@ -295,6 +334,7 @@ if sta.isconnected():
     sync_time_with_ntp()
 else:
     print("\n❌ Wi-Fi failed.")
+
 
 # ------------------------------------------------------------------------------
 # Main loop
