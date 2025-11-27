@@ -1,451 +1,398 @@
-# main.py - EnerGreen ESP32 Unified Firmware
-# Merges High-Res Transient Detection (Code 1) with Multi-Appliance Tracking (Code 2)
-# **NOW INCLUDES DEDICATED LOW-POWER WATCHER**
-# PROPERTY OF ENERGREEN
+# main.py – EnerGreen ESP32 Firmware (Unified Multi-Appliance + Low-Wattage + Heavy-Load Support)
+# ------------------------------------------------------------------------------
+#  ✅ Detects multiple appliances concurrently
+#  ✅ Detects OFF events by matching power drops
+#  ✅ Supports low-wattage devices (≥ 2 W)
+#  ✅ Keeps heavy-load stability and transient analysis
+# ------------------------------------------------------------------------------
 
-import time
-import random
-import network
-import json
-import utime
-import ntptime
+import time, json, utime, random, network, urequests, ntptime
 from machine import UART
-import gc  # free up memory
-from umqtt.simple import MQTTClient
-import ssl
-import usocket as socket
 
-# --- Configuration ---
-USE_SIMULATED_DATA = False
-POWER_CHANGE_THRESHOLD_WATT = 1.0   # Threshold for event triggering
-POWER_MIN_VALID_WATT = 1.0          # Minimum load to consider valid
-POWER_CHANGE_DEBOUNCE_SECONDS = 3   # Time to wait for signal to stabilize
-APPLIANCE_EVENT_DURATION_SECONDS = 15 # Duration to capture transient + steady state
-REGULAR_READING_INTERVAL_SECONDS = 60
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+USE_SIMULATED_DATA = False # Flag: set to True for testing without physical PZEM hardware
+POWER_CHANGE_THRESHOLD_WATT = 1.2    # Threshold (in Watts) for detecting a sudden start or stop event (NILM sensitivity)
+POWER_MIN_VALID_WATT = 0.5            # Minimum absolute power (in Watts) required for a change to be considered a real appliance event (filters noise/standby power)
+POWER_CHANGE_DEBOUNCE_SECONDS = 3     # Duration (in seconds) to wait after detecting a change, ensuring the power has stabilized before confirming the event
+REGULAR_READING_INTERVAL_SECONDS = 60 # How often (in seconds) to send a full set of meter readings to the cloud
 
+APPLIANCE_STABILIZATION_WINDOW = 8    # Time (in seconds) to wait after an ON event for the appliance to reach a stable state (e.g., an AC compressor stabilizing)
+STABILIZATION_VARIATION_WATT = 60.0   # Maximum allowed power fluctuation (in Watts) during the stabilization window for heavy loads
+TRANSIENT_CAPTURE_WINDOW = 5          # Number of samples captured at the start of an event to analyze the 'inrush current' or transient signature
+MIN_RESIDUAL_WATT = 0.5               # Minimum residual power change (in Watts) required to classify a confirmed ON event
+MIN_RESIDUAL_RELATIVE = 0.02          # Minimum residual power change required relative to the new total power
 
-# --- New Matching Tolerance Constant ---
-MAX_ABSOLUTE_DIFFERENCE = 1.0 # Max difference (in W) allowed for a positive match
-MIN_RELATIVE_TOLERANCE = 0.1  # Min difference (10%) allowed for matching large loads
-# --- Low-Power Watcher Configuration ---
-LOW_POWER_BASELINE_WATT = 2.0       # If power is below this, system is considered 'low'
-LOW_POWER_TRIGGER_WATT = 5.0        # Power jump required to trigger low-power event
-LOW_POWER_DEBOUNCE_SECONDS = 3      # Time to confirm low-power change
-
-# --- Config Import ---
+# ------------------------------------------------------------------------------
+# Cloud configuration
+# ------------------------------------------------------------------------------
 try:
-    from config import (WIFI_SSID, WIFI_PASSWORD, MQTT_BROKER, MQTT_PORT, 
-                        MQTT_USER, MQTT_PASS, MQTT_CLIENT_ID, 
-                        TOPIC_REGULAR, TOPIC_SIGNATURE, TOPIC_DEVICES)
+    # Attempts to import sensitive cloud endpoint URLs and Wi-Fi credentials from a separate file (config.py)
+    from config import (
+        CLOUD_FUNCTION_URL_READING,       # Endpoint for sending periodic power readings
+        CLOUD_FUNCTION_URL_SIGNATURE,     # Endpoint for sending detected appliance signatures (ON events)
+        CLOUD_FUNCTION_URL_CONNECTEDDEVICES, # Endpoint for notifying the cloud about connected/disconnected devices
+        WIFI_SSID,
+        WIFI_PASSWORD
+    )
 except ImportError:
-    print("Error: config.py not found. Using defaults.")
-    WIFI_SSID = 'default_ssid'
-    WIFI_PASSWORD = 'default_password'
-    TOPIC_REGULAR = b"energreen/readings"
-    TOPIC_SIGNATURE = b"energreen/signatures"
-    TOPIC_DEVICES = b"energreen/devices" 
+    print("⚠️ config.py missing; using defaults.")
+    # Default values for error handling if config.py is missing
+    CLOUD_FUNCTION_URL_READING = "http://default_reading_url"
+    CLOUD_FUNCTION_URL_SIGNATURE = "http://default_signature_url"
+    WIFI_SSID, WIFI_PASSWORD = "ssid", "password"
 
-# --- Global Variables for State Management ---
-last_power_reading = 0.0
-last_regular_reading_time = 0
-debounce_active = False
-debounce_start_time = 0
-device_id = "energreen_esp32_002"
+# ------------------------------------------------------------------------------
+# Globals (State Management)
+# ------------------------------------------------------------------------------
+device_id = "energreen_esp32" # Unique identifier for the hardware unit
+last_power_reading = 0.0      # Baseline power from the previous cycle, used to calculate the power delta (change)
+last_regular_reading_time = 0 # Timestamp of the last time a full periodic reading was sent
 
-# Buffers and cumulative tracking
-debounce_buffer = []
-cumulative_delta = 0.0
+debounce_active = False       # Flag: True when a power change is detected and the system is waiting for stability
+debounce_start_time = 0       # Timestamp when the debounce period started
+debounce_event_type = None    # Stores "ON" or "OFF" during the debounce period
 
-# Multi-label support & Device Tracking
-active_events = []
-debounce_event_type = None
-connected_devices = {} # Dictionary to store currently running appliances: {id: {info}}
+active_events = []          # List of events (ON/OFF) that have been confirmed and are currently being processed or stabilized
+connected_devices = {}      # Dictionary storing confirmed active devices (key: applianceID, value: power/metadata)
 
-# **NEW Low-Power Watcher Globals**
-low_on_timer = None 
+power_window = []             # Buffer for the sliding average calculation
+POWER_WINDOW_SIZE = 8         # Number of readings used for the sliding average (smoothing)
+low_on_timer = None           # Timer to track low-power ON events (used to debounce small loads)
+low_off_timer = None          # Timer to track low-power OFF events
 
-# Sliding average buffer
-power_window = []
-POWER_WINDOW_SIZE = 8 
+# UART for PZEM (Hardware setup for communicating with the PZEM-004T)
+pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=1000)
 
-# --- MQTT Client Setup ---
-mqtt_client = None
-mqtt_connected = False
-
-def mqtt_connect():
-    global mqtt_client, mqtt_connected
-    try:
-        # NOTE: Removed manual socket creation and wrapping.
-        # umqtt.simple will handle this internally because ssl=True is set.
-        
-        mqtt_client = MQTTClient(
-            client_id=MQTT_CLIENT_ID,
-            server=MQTT_BROKER,
-            port=MQTT_PORT,
-            user=MQTT_USER,
-            password=MQTT_PASS,
-            ssl=True,  # This tells the library to use SSL/TLS
-            ssl_params={"server_hostname": MQTT_BROKER}
-        )
-
-        mqtt_client.connect()
-        print("✅ Connected securely to MQTT broker")
-        mqtt_connected = True
-        return True
-    except Exception as e:
-        print("❌ Failed to connect to MQTT broker:", e)
-        mqtt_connected = False
-        return False
-
-# In your mqtt_publish function:
-def mqtt_publish(topic, payload):
-    global mqtt_client, mqtt_connected
-    if not mqtt_connected:
-        if not mqtt_connect():
-            return False
-    try:
-        # Check if the socket is alive before publishing
-        mqtt_client.ping() 
-        mqtt_client.publish(topic, json.dumps(payload))
-        print(f"Sent to {topic}: {json.dumps(payload)}")
-        return True
-    except Exception as e:
-        print("Failed to publish, attempting reconnect:", e)
-        mqtt_connected = False  # Mark as disconnected
-        try:
-            if mqtt_connect():
-                mqtt_client.publish(topic, json.dumps(payload))
-                return True
-        except Exception as e_retry:
-            print("Retry failed:", e_retry)
-            return False
-
+# ------------------------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------------------------
 def smoothed_power(new_reading):
-    """Maintain a sliding average of power to reduce fluctuations."""
-    global power_window
+    """Calculates a moving average of recent power readings to filter out measurement noise and spikes."""
     power_window.append(new_reading)
     if len(power_window) > POWER_WINDOW_SIZE:
-        power_window.pop(0)
+        power_window.pop(0) # Remove the oldest reading
     return sum(power_window) / len(power_window)
 
-def find_best_match_for_drop(drop_watt):
-    """
-    (From Code 2) Find the connected device whose power roughly matches the observed drop.
-    Returns the device ID if found, else None.
-    """
-    if not connected_devices:
-        return None
-    
-    best_id, best_diff = None, 1e9
-    
-    # Iterate through connected devices to find the closest wattage match
-    for aid, info in connected_devices.items():
-        stored_watt = info.get("powerWatt", 0)
-        diff = abs(stored_watt - drop_watt)
-        
-        # Tolerance logic: Allow difference of 10W or 40% of the device's power (whichever is larger)
-        tolerance = max(MAX_ABSOLUTE_DIFFERENCE, MIN_RELATIVE_TOLERANCE * stored_watt)
-        
-        # Update best match only if the difference is within tolerance AND is the closest match so far.
-        if diff <= tolerance and diff < best_diff:
-            best_diff = diff
-            best_id = aid
-            
-    return best_id
-
-# --- PZEM-004T V3.0 Setup ---
-pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=500)
-
 def modbus_crc16(data):
+    """Calculates the CRC-16 checksum required for the Modbus RTU communication protocol used by the PZEM-004T."""
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if crc & 0x0001:
-                crc >>= 1
-                crc ^= 0xA001
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
             else:
                 crc >>= 1
+    # Returns the 16-bit CRC as two separate bytes
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 def sync_time_with_ntp(max_retries=5):
-    print("Attempting to sync time via NTP...")
-    ntptime.host = 'pool.ntp.org'
+    """Connects to multiple Network Time Protocol (NTP) servers to synchronize the ESP32's internal clock."""
+    import ntptime, time
+    servers = ['time.google.com', 'time.cloudflare.com', 'pool.ntp.org']
     for i in range(max_retries):
-        try:
-            ntptime.settime()
-            print("Time synced:", utime.localtime())
-            return True
-        except Exception:
-            time.sleep(1)
+        for host in servers:
+            try:
+                ntptime.host = host
+                ntptime.settime()
+                print("✅ NTP synced via", host)
+                return True
+            except Exception as e:
+                print(f"⚠️ Attempt {i+1} failed with {host}: {e}")
+                time.sleep(2)
+    print("❌ All NTP attempts failed.")
     return False
 
+def print_connected_devices():
+    """Prints a formatted list of currently known active appliances for debugging and monitoring."""
+    if connected_devices:
+        print("➡️ Connected devices:",
+              [f"{v['name']} ({k}) - {v['powerWatt']}W" for k, v in connected_devices.items()])
+    else:
+        print("➡️ No devices connected.")
+
+# ------------------------------------------------------------------------------
+# PZEM reading
+# ------------------------------------------------------------------------------
 def pzem_data():
+    """Sends a Modbus command and parses the response from the PZEM-004T sensor to get power metrics."""
     try:
-        # Clear buffer
-        while pzem_uart.any(): pzem_uart.read()
-        
-        base_cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
-        cmd = base_cmd + modbus_crc16(base_cmd)
-        pzem_uart.write(cmd)
+        # Clears the UART buffer of any residual data
+        _ = pzem_uart.read()
         time.sleep_ms(50)
-        
-        response = pzem_uart.read()
-        if not response or len(response) < 25: return None
-        
-        data = response[3:23]
-        
+        # Constructs the Modbus command to read input registers (voltage, current, power, etc.)
+        cmd = bytes([0x01, 0x04, 0x00, 0x00, 0x00, 0x0A])
+        cmd += modbus_crc16(cmd)
+        pzem_uart.write(cmd)
+        time.sleep_ms(400) # Wait for the PZEM to respond
+        res = pzem_uart.read()
+        if not res or len(res) < 21: return None # Basic check for minimum response length
+
+        data = res[3:23]
         def u32(payload, offset):
-            return (int.from_bytes(payload[offset+2:offset+4], 'big') << 16) | \
-                   int.from_bytes(payload[offset:offset+2], 'big')
-
-        voltage = int.from_bytes(data[0:2], 'big') / 10.0
-        current = u32(data, 2) / 1000.0
-        power   = u32(data, 6) / 10.0
-        energy  = u32(data, 10) / 1000.0
-        freq    = int.from_bytes(data[14:16], 'big') / 10.0
-        pf      = int.from_bytes(data[16:18], 'big') / 100.0
-
+            """Helper function to combine 16-bit registers into 32-bit values (PZEM format)."""
+            low = int.from_bytes(payload[offset:offset+2],'big')
+            high = int.from_bytes(payload[offset+2:offset+4],'big')
+            return (high<<16)|low
+        
+        # Extracts and scales the raw data registers
+        voltage = int.from_bytes(data[0:2],'big')/10
+        current = u32(data,2)/1000
+        power = u32(data,6)/10
+        pf = int.from_bytes(data[16:18],'big')/100
+        energy = u32(data,10)/1000
+        
+        # Returns the cleaned data dictionary
         return {
-            "deviceId": device_id,
-            "timestamp": utime.time(),
-            "voltageVolt": round(voltage, 1),
-            "currentAmp": round(current, 3),
-            "powerWatt": round(power, 1),
-            "kwhConsumed": round(energy, 3),
-            "frequencyHz": round(freq, 1),
-            "powerFactor": round(pf, 2),
-            "energySource": "Grid"
+            "deviceId":device_id,
+            "timestamp":utime.time(),
+            "voltageVolt":round(voltage,1),
+            "currentAmp":round(current,3),
+            "powerWatt":round(power,1),
+            "kwhConsumed":round(energy,3),
+            "powerFactor":round(pf,2),
         }
     except Exception as e:
-        print("PZEM Read Error:", e)
+        print("Error PZEM:", e)
         return None
 
-def simulate_pzem_data():
-    # Simplified simulation for testing
-    return {
-        "deviceId": device_id,
-        "voltageVolt": 220.0,
-        "currentAmp": 0.5,
-        "powerWatt": 100.0 + random.uniform(-2, 2),
-        "kwhConsumed": 10.0,
-        "frequencyHz": 60.0,
-        "powerFactor": 0.9,
-        "energySource": "Grid",
-        "timestamp": utime.time()
-    }
+# ------------------------------------------------------------------------------
+# Cloud helper
+# ------------------------------------------------------------------------------
+def send_signature_to_cloud(sig):
+    """Sends the captured appliance power signature data to the cloud for NILM analysis and device identification."""
+    try:
+        print("📡 Sending signature to cloud...")
+        # Uses urequests to send an HTTP POST request to the CLOUD_FUNCTION_URL_SIGNATURE endpoint
+        resp = urequests.post(CLOUD_FUNCTION_URL_SIGNATURE,
+                              data=json.dumps(sig),
+                              headers={"Content-Type": "application/json"})
+        raw = resp.text
+        print("☁️ Cloud response:", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        resp.close() # Close the connection to free up resources
+        return data # Returns the cloud's response (which usually contains the identified appliance ID and Name)
+    except Exception as e:
+        print("❌ Cloud send error:", e)
+        return {}
 
-# --------------------------------------------------------------------------------
-# CORE LOGIC: Appliance Event Detection & Tracking (Modified to include Low-Power Watcher)
-# --------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Event detection (Core NILM Logic)
+# ------------------------------------------------------------------------------
+def find_best_match_for_drop(drop_watt):
+    """
+    Identifies which currently 'connected_device' likely turned OFF by matching the observed power drop.
+    This is critical for the multi-appliance logic.
+    """
+    if not connected_devices:
+        return None
+    best_id, best_diff = None, 1e9
+    # Iterates through all currently known active devices
+    for aid, info in connected_devices.items():
+        # Calculates the difference between the device's known power and the observed power drop
+        diff = abs(info.get("powerWatt",0)-drop_watt)
+        if diff < best_diff:
+            best_diff, best_id = diff, aid
+    # Checks if the best match is within an acceptable margin of error (10W or 40% of the device's known power)
+    if best_id and best_diff <= max(10,0.4*connected_devices[best_id]['powerWatt']):
+        return best_id # Returns the unique ID of the device that turned OFF
+    return None
+
 def detect_appliance_event(reading):
-    global last_power_reading, debounce_active, debounce_start_time
-    global active_events, debounce_event_type, debounce_buffer, cumulative_delta
-    global connected_devices, low_on_timer 
+    """Main NILM function: Manages the lifecycle of appliance events (detection, debounce, stabilization, identification)."""
+    global last_power_reading, debounce_active, debounce_start_time, debounce_event_type
+    global active_events, connected_devices, low_on_timer, low_off_timer
 
     current_power = smoothed_power(reading["powerWatt"])
     now = utime.time()
+    delta = current_power - last_power_reading # The instantaneous change in power
 
-    if last_power_reading == 0.0: last_power_reading = current_power
-
-    # Calculate Delta for Main Detection (Dual Trigger)
-    step_delta = current_power - last_power_reading
-    cumulative_delta += step_delta
-    
-    # 1. Main Detection - Check for Step or Gradual Change
-    trigger_now = False
-    event_delta = 0.0
-
-    if (abs(step_delta) >= POWER_CHANGE_THRESHOLD_WATT) and (not debounce_active):
-        trigger_now = True
-        event_delta = step_delta
-    elif (abs(cumulative_delta) >= POWER_CHANGE_THRESHOLD_WATT) and (not debounce_active):
-        trigger_now = True
-        event_delta = cumulative_delta
-
-    if trigger_now:
+    # --- Candidate event detection ---
+    # Triggers if the power delta is large enough AND no other event is currently being debounced
+    if abs(delta) > POWER_CHANGE_THRESHOLD_WATT and not debounce_active:
         debounce_active = True
         debounce_start_time = now
-        debounce_event_type = "ON" if event_delta > 0 else "OFF"
-        debounce_buffer = [current_power]
-        print(f"⚡ Candidate {debounce_event_type} detected (main logic)...")
+        debounce_event_type = "ON" if delta > 0 else "OFF"
+        pre_snapshot = last_power_reading # The power level before the change
+        print(f"⚡ Candidate {debounce_event_type} ΔP={delta:.1f}W")
 
-    elif debounce_active:
-        debounce_buffer.append(current_power)
+    # --- Debounce complete and event confirmation ---
+    if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
+        # Create a new active event record
+        event = {
+            "event_type": debounce_event_type,
+            "start_time": now,
+            "pre_total": last_power_reading,
+            "stabilization_time": now + APPLIANCE_STABILIZATION_WINDOW,
+            "finalized": False
+        }
+        active_events.append(event)
+        print(f"✅ Confirmed {debounce_event_type} pre_total={last_power_reading:.1f}W")
+        # Reset debounce state to allow detection of new, simultaneous events
+        debounce_active = False
+        debounce_event_type = None
 
-    # 2. **DEDICATED LOW-POWER WATCHER (NEW BLOCK)**
-    # This watches for a small, stable ON event from a very low baseline.
-    if current_power > LOW_POWER_TRIGGER_WATT and last_power_reading < LOW_POWER_BASELINE_WATT and not debounce_active:
+    # --- Low-power ON watcher (for very small loads that might be missed by the main threshold) ---
+    if last_power_reading < 1.0 and current_power > 2.0:
         if low_on_timer is None:
             low_on_timer = now
-        elif (now - low_on_timer) >= LOW_POWER_DEBOUNCE_SECONDS:
-            # Low-power event confirmed, process it immediately as a signature event
-            approx_load_watt = current_power - last_power_reading
-            print(f"🌿 Low-Power ON confirmed ({approx_load_watt:.1f}W). Processing signature...")
-            
-            # Create a simplified event structure for immediate processing
-            active_events.append({
-                "event_type": "ON",
-                "start_time": now,
-                "buffer": [{ # Simplified buffer with current reading
-                    "timestamp": reading["timestamp"],
-                    "powerWatt": current_power,
-                    "powerFactor": reading["powerFactor"],
-                    "voltageVolt": reading["voltageVolt"],
-                    "currentAmp": reading["currentAmp"]
-                }],
-                "delta_power": approx_load_watt,
-                "low_power_event": True # Flag to skip main debounce checks
-            })
-            low_on_timer = None
-    else:
-        low_on_timer = None # Reset if condition is broken
-        
-    # 3. Confirm Main Event (Debounce and Stability Check)
-    if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
-        avg_power = sum(debounce_buffer) / len(debounce_buffer)
-        stability = max(debounce_buffer) - min(debounce_buffer)
-        STABILITY_THRESHOLD_W = 1.5
-
-        if stability <= STABILITY_THRESHOLD_W:
-            # Determine the actual power change magnitude based on buffer vs previous baseline
-            estimated_delta = avg_power - (last_power_reading - cumulative_delta) 
-            
-            active_events.append({
-                "event_type": debounce_event_type,
-                "start_time": now,
-                "buffer": [], # Start capturing the full signature now
-                "delta_power": estimated_delta if abs(estimated_delta) > 0 else event_delta
-            })
-            print(f"✅ Confirmed {debounce_event_type} event (Delta: {active_events[-1]['delta_power']:.1f}W).")
-        else:
-            print(f"❌ Event rejected (unstable: {stability:.2f}W).")
-
-        debounce_active = False
-        debounce_buffer = []
-        cumulative_delta = 0.0
-
-    # 4. Process Active Events (Capture & Finalize)
-    for event in list(active_events):
-        
-        # Capture full signature for long-running events only
-        if not event.get("low_power_event", False):
-            event["buffer"].append({
-                "timestamp": reading["timestamp"],
-                "powerWatt": current_power,
-                "powerFactor": reading["powerFactor"],
-                "voltageVolt": reading["voltageVolt"],
-                "currentAmp": reading["currentAmp"]
-            })
-
-        # Check if Event Duration is Complete or if it's a Low-Power Event (which processes immediately)
-        if (now - event["start_time"]) >= APPLIANCE_EVENT_DURATION_SECONDS or event.get("low_power_event", False):
-            
-            buf = event["buffer"]
-            
-            if event.get("low_power_event", False):
-                # For low-power, the signature is the instantaneous reading
-                transient_data = buf
-                steady_data = buf
-                approx_load_watt = event["delta_power"]
-            else:
-                # For main logic, calculate signature from buffer
-                transient_data = buf[:3] if len(buf) >= 3 else buf
-                steady_data = buf[-3:] if len(buf) >= 3 else buf
-                approx_load_watt = abs(event["delta_power"])
-            
-            # --- A. Send Signature to MQTT ---
-            event_signature = {
+        elif now - low_on_timer > 3: # If the low-power state persists for > 3 seconds
+            print(f"🌿 Low-power ON detected ({current_power:.1f}W)")
+            # Constructs a minimal signature payload for the cloud
+            sig = {
                 "dataType": "ApplianceSignature",
                 "deviceId": device_id,
-                "event_type": event["event_type"],
-                "transient_data": transient_data,
-                "steady_state_data": steady_data,
-                "delta_watt": event["delta_power"],
-                "timestamp": now
+                "event_type": "ON",
+                "signature_data": [{"timestamp": reading["timestamp"], "powerWatt": round(current_power,1), "powerFactor": reading["powerFactor"]}],
+                "features": {"steady_avg_power": round(current_power,1), "powerFactor": reading["powerFactor"]}
             }
-            mqtt_publish(TOPIC_SIGNATURE, event_signature)
-
-            # --- B. Update Connected Devices List ---
-            if event["event_type"] == "ON":
-                appliance_id = str(int(now)) # Use timestamp as a temporary unique ID
-                
-                new_device = {
-                    "applianceID": appliance_id,
-                    "name": f"Device_{appliance_id}",
-                    "powerWatt": approx_load_watt,
-                    "powerFactor": reading["powerFactor"],
-                    "on_timestamp": now
+            res = send_signature_to_cloud(sig)
+            # If the cloud successfully identifies the appliance, store it locally
+            if res.get("applianceID"):
+                aid = res["applianceID"]
+                connected_devices[aid] = {
+                    "name": res.get("applianceName","Unknown"),
+                    "powerWatt": sig["features"]["steady_avg_power"],
+                    "powerFactor": sig["features"]["powerFactor"],
+                    "last_seen": now
                 }
-                
-                connected_devices[appliance_id] = new_device
-                print(f" >>> DEVICE CONNECTED: {new_device['name']} ({new_device['powerWatt']:.1f}W)")
-                mqtt_publish(TOPIC_DEVICES, {"action": "connect", "device": new_device})
+                print("🔌 Device connected:", connected_devices[aid]["name"])
+            low_on_timer = None
+    else:
+        low_on_timer = None
 
-            elif event["event_type"] == "OFF":
-                drop_watt = abs(event["delta_power"])
-                matched_id = find_best_match_for_drop(drop_watt)
-                
-                if matched_id:
-                    removed_device = connected_devices.pop(matched_id)
-                    print(f" <<< DEVICE DISCONNECTED: {removed_device['name']} (Expected ~{drop_watt:.1f}W)")
-                    mqtt_publish(TOPIC_DEVICES, {"action": "disconnect", "device": removed_device})
-                else:
-                    print(f" <<< UNKNOWN DEVICE DISCONNECTED (Drop: {drop_watt:.1f}W)")
+    # --- Process active events (Multi-appliance logic) ---
+    for ev in list(active_events):
+        # 1. Check if the stabilization window is over
+        if now >= ev["stabilization_time"] and not ev["finalized"]:
+            residual = current_power - ev["pre_total"] # Final power change (residual power of the new appliance)
 
-            # Remove processed event
-            active_events.remove(event)
+            if ev["event_type"] == "ON" and residual >= MIN_RESIDUAL_WATT:
+                # FINALIZING ON EVENT: Send signature to cloud for matching/learning
+                sig = {
+                    # ... constructs the signature payload using the residual power ...
+                    "dataType": "ApplianceSignature",
+                    "deviceId": device_id,
+                    "event_type": "ON",
+                    "signature_data": [{"timestamp": reading["timestamp"], "powerWatt": round(residual,1), "powerFactor": reading["powerFactor"]}],
+                    "features": {"steady_avg_power": round(residual,1), "powerFactor": reading["powerFactor"]}
+                }
+                res = send_signature_to_cloud(sig)
+                if res.get("applianceID"):
+                    aid = res["applianceID"]
+                    # Store the new active device in the local connected_devices dictionary
+                    connected_devices[aid] = {
+                        "name": res.get("applianceName","Unknown"),
+                        "powerWatt": sig["features"]["steady_avg_power"],
+                        "powerFactor": reading["powerFactor"],
+                        "last_seen": now,
+                        "applianceID": aid
+                    }
+                    print(f"🔌 Device connected: {connected_devices[aid]['name']} ({aid})")
+                    send_connected_device_to_cloud(connected_devices[aid], "connect") # Notify cloud of new connection
+                    print_connected_devices()
 
-    # Update baseline
-    last_power_reading = current_power
+            elif ev["event_type"] == "OFF":
+                # FINALIZING OFF EVENT: Match power drop against connected devices
+                drop = ev["pre_total"] - current_power # The total power drop
+                if drop > 0:
+                    match = find_best_match_for_drop(drop)
+                    if match:
+                        info = connected_devices.pop(match) # Remove the device from the active list
+                        print(f"❌ Device disconnected: {info['name']} ({match})")
+                        info["applianceID"] = match
+                        send_connected_device_to_cloud(info, "disconnect") # Notify cloud of disconnection
+                        print_connected_devices()
+            
+            ev["finalized"] = True
+            active_events.remove(ev) # Remove the event from the list after processing
 
-# --- Initialization (omitted for brevity) ---
-# ... (Wi-Fi and MQTT setup remain the same) ...
-sta_if = network.WLAN(network.STA_IF)
-sta_if.active(True)
-sta_if.connect(WIFI_SSID, WIFI_PASSWORD)
+    last_power_reading = current_power # Update the baseline for the next cycle
 
+# --------------------------------------------------------------------------
+# Connected Devices Cloud Sync
+# --------------------------------------------------------------------------
+def send_connected_device_to_cloud(device_info, action):
+    """
+    Sends notification to the cloud whenever an appliance turns ON (connect) or OFF (disconnect).
+    This updates the cloud's real-time inventory of active appliances.
+    """
+    try:
+        print(f"📤 Sending {action.upper()} event for {device_info.get('name','Unknown')}...")
+        payload = {
+            "deviceId": device_id,
+            "action": action,
+            "applianceID": device_info.get("applianceID", None),
+            "applianceName": device_info.get("name", "Unknown"),
+            "powerWatt": device_info.get("powerWatt", 0),
+            "powerFactor": device_info.get("powerFactor", 0),
+            "timestamp": utime.time()
+        }
+        # Uses urequests to send an HTTP POST request to the cloud endpoint
+        resp = urequests.post(CLOUD_FUNCTION_URL_CONNECTEDDEVICES,
+                              data=json.dumps(payload),
+                              headers={"Content-Type": "application/json"})
+        print("☁️ ConnectedDevices response:", resp.text)
+        resp.close()
+    except Exception as e:
+        print("❌ Error sending connected device to cloud:", e)
+
+
+# ------------------------------------------------------------------------------
+# Wi-Fi connection
+# ------------------------------------------------------------------------------
+# Initializes the Wi-Fi station interface
+sta = network.WLAN(network.STA_IF)
 print("Connecting to Wi-Fi...")
-timeout = 0
-while not sta_if.isconnected() and timeout < 30:
-    time.sleep(1)
-    timeout += 1
-
-if sta_if.isconnected():
-    print("Wi-Fi Connected!", sta_if.ifconfig())
-    sync_time_with_ntp()
-    mqtt_connect()
+sta.active(True)
+sta.connect(WIFI_SSID, WIFI_PASSWORD)
+# Wait loop for connection
+for _ in range(30):
+    if sta.isconnected(): break
+    print(".", end=""); time.sleep(1)
+if sta.isconnected():
+    print("\n✅ Wi-Fi connected:", sta.ifconfig())
+    sync_time_with_ntp() # Synchronize time once connected
 else:
-    print("Wi-Fi Failed.")
+    print("\n❌ Wi-Fi failed.")
 
-# --- Main Loop (remains the same) ---
-# ... (while True: loop remains the same) ...
+
+# ------------------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------------------
+print("EnerGreen ready.")
 while True:
     try:
-        reading = simulate_pzem_data() if USE_SIMULATED_DATA else pzem_data()
-
+        # Read data from PZEM (or simulate if configured)
+        reading = pzem_data() if not USE_SIMULATED_DATA else None
         if reading:
-            detect_appliance_event(reading)
+            # Print the raw meter reading for live debugging
+            print(
+                f"[Reading]\n"
+                f"[V]{reading['voltageVolt']:.1f} V || [C]{reading['currentAmp']:.3f} A || [P]{reading['powerWatt']:.1f} W || [E]{reading['kwhConsumed']:.3f} kWh || [PF]{reading['powerFactor']:.2f}\n"
+                "----------------------------------------------------------------"
+            )
+            detect_appliance_event(reading) # Run the core NILM logic
 
-            # Periodic Regular Reading
             now = utime.time()
+            # Check if it's time to send a regular periodic reading
             if now - last_regular_reading_time >= REGULAR_READING_INTERVAL_SECONDS:
                 reading["dataType"] = "RegularReading"
-                reading["connected_count"] = len(connected_devices)
-                mqtt_publish(TOPIC_REGULAR, reading)
+                # Send the reading via HTTP POST to the cloud endpoint
+                resp = urequests.post(CLOUD_FUNCTION_URL_READING,
+                                      data=json.dumps(reading),
+                                      headers={"Content-Type": "application/json"})
+                print("☁️ Readings response:", resp.text)
+                resp.close()
                 last_regular_reading_time = now
-                
-                print("--- Active Devices ---")
-                for uid, dev in connected_devices.items():
-                    print(f"ID: {uid} | Power: {dev['powerWatt']:.1f}W")
-                print("----------------------")
-
-        utime.sleep(1)
-
+        else:
+            print("No reading.")
+        time.sleep(1) # Wait 1 second before the next reading cycle
     except Exception as e:
-        print("Loop Error:", e)
-        try:
-            mqtt_connect()
-        except:
-            pass
-        utime.sleep(5)
+        print("Loop error:", e)
+        time.sleep(5) # Wait longer on error before trying again
