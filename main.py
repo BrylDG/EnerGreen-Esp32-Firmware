@@ -1,17 +1,20 @@
-# main.py - EnerGreen merged firmware (MQTT + NILM + Stabilized signature flow)
-# NOTE: Expects config.py to define MQTT_* constants and TOPIC_* topics.
+# main.py - EnerGreen merged firmware (MQTT + NILM + Multi-appliance + Low-watt + Heavy-load)
+# Option A: firmware stabilizes signature, publishes to MQTT TOPIC_SIGNATURE,
+# waits for cloud match on TOPIC_MATCH, registers matched appliance locally and publishes CONNECT to TOPIC_CONNECTED.
+# -------------------------------------------------------------------------
 
 import time
 import json
 import utime
-import ntptime
 import gc
 import random
 import network
+import urequests
 import ssl
 import usocket as socket
 from machine import UART
 from umqtt.simple import MQTTClient
+import os
 
 # -------------------------------------------------------------------------
 # Configuration (from config.py)
@@ -27,26 +30,26 @@ try:
         MQTT_CLIENT_ID,
         TOPIC_REGULAR,
         TOPIC_SIGNATURE,
-        TOPIC_CONNECTED
+        TOPIC_CONNECTED,
+        TOPIC_MATCH
     )
 except ImportError:
-    print("Error: config.py missing or incomplete — using placeholders.")
+    # Provide safe defaults to avoid crashes during early testing
+    print("⚠️ config.py missing or incomplete — using placeholders.")
     WIFI_SSID = "ssid"
-    WIFI_PASSWORD = "pass"
-    MQTT_BROKER = "broker"
+    WIFI_PASSWORD = "password"
+    MQTT_BROKER = "broker.hivemq.com"
     MQTT_PORT = 8883
-    MQTT_USER = "user"
-    MQTT_PASS = "pass"
-    MQTT_CLIENT_ID = "energreen_esp"
-    TOPIC_REGULAR = "energreen/reading"
-    TOPIC_SIGNATURE = "energreen/signature"
-    TOPIC_CONNECTED = "energreen/connected"
-
-# Response topic pattern (cloud should publish to this topic with correlation)
-TOPIC_SIGNATURE_RESPONSE = TOPIC_SIGNATURE + "/response/" + MQTT_USER
+    MQTT_USER = "energreen_user"
+    MQTT_PASS = ""
+    MQTT_CLIENT_ID = "energreen_client"
+    TOPIC_REGULAR = b"/energy/003/readings"
+    TOPIC_SIGNATURE = b"/energy/003/signatures"
+    TOPIC_CONNECTED = b"/energy/003/connected"
+    TOPIC_MATCH = b"/energy/003/matches"
 
 # -------------------------------------------------------------------------
-# Tuning parameters (NILM & timing)
+# Tuning parameters
 # -------------------------------------------------------------------------
 USE_SIMULATED_DATA = False
 
@@ -61,13 +64,12 @@ TRANSIENT_CAPTURE_WINDOW = 5
 MIN_RESIDUAL_WATT = 0.5
 MIN_RESIDUAL_RELATIVE = 0.02
 
-# smoothing
-POWER_WINDOW_SIZE = 8
+POWER_WINDOW_SIZE = 8  # smoothing
 
 # -------------------------------------------------------------------------
-# Globals (State Management)
+# Globals
 # -------------------------------------------------------------------------
-device_id = MQTT_USER
+device_id = MQTT_USER                # confirmed by you
 last_power_reading = 0.0
 last_regular_reading_time = 0
 
@@ -78,13 +80,13 @@ debounce_event_type = None
 debounce_buffer = []
 cumulative_delta = 0.0
 
-active_events = []          # List of events currently being captured or stabilized (ON/OFF)
-connected_devices = {}      # Local cache of appliances known to be ON {applianceID: info}
+active_events = []         # pending ON/OFF transitions with capture buffers
+connected_devices = {}     # applianceID -> { name, powerWatt, powerFactor, last_seen }
 
 # smoothing buffer
 power_window = []
 
-# low-watt timers (global scope)
+# low-watt timers
 low_on_timer = None
 low_off_timer = None
 
@@ -92,14 +94,14 @@ low_off_timer = None
 mqtt_client = None
 mqtt_connected = False
 
-# Holds pending signature results keyed by signature_id
-pending_signature_results = {}
+# pending matches store: signature_nonce -> dict (filled by callback)
+pending_matches = {}
 
 # UART to PZEM
 pzem_uart = UART(2, baudrate=9600, tx=17, rx=16, timeout=1000)
 
 # -------------------------------------------------------------------------
-# I. Utility Functions
+# Helpers
 # -------------------------------------------------------------------------
 def smoothed_power(new_reading):
     global power_window
@@ -120,27 +122,34 @@ def modbus_crc16(data):
                 crc >>= 1
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
-def sync_time_with_ntp(max_retries=5, timeout=3):
-    ntptime.host = "pool.ntp.org"
-    for i in range(max_retries):
-        try:
-            ntptime.settime()
-            print("NTP synced:", utime.localtime())
-            return True
-        except Exception as e:
-            print("⚠️ Attempt", i+1, "failed with", e)
-            time.sleep(timeout)
-    print("❌ All NTP attempts failed.")
-    return False
+def compute_variation(buffer):
+    if not buffer:
+        return 0.0
+    vals = [b["powerWatt"] for b in buffer]
+    return max(vals) - min(vals)
+
+def compute_slope(buffer):
+    if not buffer or len(buffer) < 2:
+        return 0.0
+    total_slope = 0.0
+    count = 0
+    for i in range(1, len(buffer)):
+        dt = buffer[i]["timestamp"] - buffer[i-1]["timestamp"]
+        if dt <= 0:
+            continue
+        dp = buffer[i]["powerWatt"] - buffer[i-1]["powerWatt"]
+        total_slope += abs(dp / dt)
+        count += 1
+    return (total_slope / count) if count else 0.0
 
 def print_connected_devices():
     if connected_devices:
-        print("➡️ Connected devices:", [f"{v['name']} ({k}) - {v['powerWatt']}W" for k,v in connected_devices.items()])
+        print("➡️ Connected devices:", [f"{v['name']} ({k}) - {v['powerWatt']}W" for k, v in connected_devices.items()])
     else:
         print("➡️ No devices connected.")
 
 # -------------------------------------------------------------------------
-# II. Data Acquisition (PZEM)
+# PZEM reading
 # -------------------------------------------------------------------------
 def pzem_data():
     try:
@@ -178,10 +187,13 @@ def pzem_data():
         power = power_raw / 10.0
         energy_kwh = energy_raw / 1000.0
 
-        # Basic range validation
-        if not (0.0 <= voltage <= 300.0): return None
-        if not (0.0 <= current <= 200.0): return None
-        if not (-10000.0 <= power <= 10000.0): return None
+        # basic sanity checks
+        if not (0.0 <= voltage <= 300.0):
+            return None
+        if not (0.0 <= current <= 200.0):
+            return None
+        if not (-10000.0 <= power <= 10000.0):
+            return None
 
         return {
             "deviceId": device_id,
@@ -214,64 +226,36 @@ def simulate_pzem_data():
     }
 
 # -------------------------------------------------------------------------
-# III. MQTT Helpers (Secure Communication)
+# MQTT helpers
 # -------------------------------------------------------------------------
-def mqtt_callback(topic, msg):
-    """
-    Expected payload from cloud:
-    {
-      "signature_id": "...",
-      "result": "match"|"new",
-      "applianceID": "...",
-      "applianceName": "...",
-      "powerWatt": 123.4
-    }
-    """
-    global pending_signature_results
-    try:
-        data = json.loads(msg)
-        sig_id = data.get("signature_id") or data.get("signatureId") or data.get("sig_id")
-        if sig_id:
-            pending_signature_results[sig_id] = data
-            print("☁️ Received signature response for", sig_id, "->", data.get("result"))
-        else:
-            # If cloud sends appliance updates without signature_id, handle them too (best-effort)
-            aid = data.get("applianceID") or data.get("applianceId")
-            if aid:
-                connected_devices[aid] = {
-                    "name": data.get("applianceName", "Unknown"),
-                    "powerWatt": data.get("powerWatt", 0),
-                    "powerFactor": data.get("powerFactor", 0),
-                    "last_seen": utime.time()
-                }
-                print("☁️ Cloud update: registered appliance", aid)
-    except Exception as e:
-        print("⚠️ mqtt_callback parse error:", e)
-
 def mqtt_connect():
-    """
-    Connects and subscribes to response topic so cloud can reply with appliance matches.
-    """
     global mqtt_client, mqtt_connected
     try:
-        if mqtt_client is None:
-            mqtt_client = MQTTClient(client_id=MQTT_CLIENT_ID,
-                                     server=MQTT_BROKER,
-                                     port=MQTT_PORT,
-                                     user=MQTT_USER,
-                                     password=MQTT_PASS,
-                                     ssl=True,
-                                     ssl_params={"server_hostname": MQTT_BROKER})
-            mqtt_client.set_callback(mqtt_callback)
+        # Use SSL if port is 8883, otherwise plain
+        use_ssl = True if MQTT_PORT == 8883 else False
+        mqtt_client = MQTTClient(client_id=MQTT_CLIENT_ID,
+                                 server=MQTT_BROKER,
+                                 port=MQTT_PORT,
+                                 user=MQTT_USER,
+                                 password=MQTT_PASS,
+                                 ssl=use_ssl,
+                                 ssl_params={"server_hostname": MQTT_BROKER} if use_ssl else None)
+        # set callback BEFORE connect so subscriptions are handled
+        mqtt_client.set_callback(mqtt_callback)
         mqtt_client.connect()
-        # subscribe to signature response topic (cloud must publish here)
-        mqtt_client.subscribe(TOPIC_SIGNATURE_RESPONSE)
         mqtt_connected = True
-        print("✅ MQTT connected and subscribed to", TOPIC_SIGNATURE_RESPONSE)
+        print("✅ MQTT connected")
+        # subscribe to MATCH topic (cloud -> device)
+        try:
+            mqtt_client.subscribe(TOPIC_MATCH)
+            print("✅ Subscribed to match topic:", TOPIC_MATCH)
+        except Exception as e:
+            print("⚠️ Subscribe failed:", e)
+        return True
     except Exception as e:
         mqtt_connected = False
-        print("❌ MQTT connect/subscribe failed:", e)
-    return mqtt_connected
+        print("❌ MQTT connect failed:", e)
+        return False
 
 def mqtt_publish(topic, payload):
     global mqtt_connected, mqtt_client
@@ -294,51 +278,81 @@ def mqtt_publish(topic, payload):
         return False
 
 # -------------------------------------------------------------------------
-# IV. Cloud Synchronization Functions
+# MQTT callback - receives match responses from cloud
+# Payload expected: {"signature_nonce":"abc123","applianceID":"...","applianceName":"...","matchScore":0.9}
 # -------------------------------------------------------------------------
-def send_signature_and_wait_for_match(signature_msg, timeout_seconds=6):
+def mqtt_callback(topic, msg):
+    global pending_matches
+    try:
+        # msg may be bytes
+        payload = msg.decode() if isinstance(msg, (bytes, bytearray)) else str(msg)
+        data = json.loads(payload)
+        if not data:
+            return
+        nonce = data.get("signature_nonce") or data.get("signatureNonce") or data.get("nonce")
+        if nonce:
+            pending_matches[nonce] = {
+                "applianceID": data.get("applianceID"),
+                "applianceName": data.get("applianceName"),
+                "matchScore": data.get("matchScore", 0.0),
+                "raw": data
+            }
+            print("☁️ Received match for nonce", nonce, "->", pending_matches[nonce])
+    except Exception as e:
+        print("⚠️ mqtt_callback error:", e)
+
+# -------------------------------------------------------------------------
+# Publish signature and wait for cloud match
+# -------------------------------------------------------------------------
+def publish_signature_and_wait_for_match(signature_msg, wait_seconds=6):
     """
-    Publishes signature_msg (must include 'signature_id') to TOPIC_SIGNATURE, then waits
-    briefly for the cloud to respond on TOPIC_SIGNATURE_RESPONSE with the same signature_id.
-
-    Returns: dict (cloud response) or None if no response
+    Publishes signature_msg (dict) to TOPIC_SIGNATURE with generated signature_nonce.
+    Then waits up to wait_seconds for the cloud to publish a response to TOPIC_MATCH
+    that contains the same signature_nonce. Returns matched dict or None.
     """
-    global pending_signature_results, mqtt_client, mqtt_connected
+    # ensure signature_nonce
+    nonce = signature_msg.get("signature_nonce")
+    if not nonce:
+        # simple nonce: device + timestamp + random int
+        nonce = "{}-{}-{}".format(device_id, int(utime.time()), random.getrandbits(16))
+        signature_msg["signature_nonce"] = nonce
 
-    sig_id = signature_msg.get("signature_id")
-    if not sig_id:
-        # ensure signature_id exists
-        sig_id = str(int(utime.time())) + "_" + str(random.getrandbits(16))
-        signature_msg["signature_id"] = sig_id
-
-    # Attempt publish
-    ok = mqtt_publish(TOPIC_SIGNATURE, signature_msg)
-    if not ok:
-        return None
-
-    # Wait up to timeout_seconds for pending_signature_results[sig_id] to arrive
-    deadline = utime.time() + timeout_seconds
-    while utime.time() < deadline:
-        # allow incoming messages to be processed
+    # clear any stale pending
+    if nonce in pending_matches:
         try:
-            mqtt_client.check_msg()
-        except Exception:
-            # if check_msg errors, try reconnect later
+            del pending_matches[nonce]
+        except:
             pass
 
-        if sig_id in pending_signature_results:
-            resp = pending_signature_results.pop(sig_id)
-            return resp
-        # small delay to avoid busy-looping
-        time.sleep_ms(200)
+    # publish
+    ok = mqtt_publish(TOPIC_SIGNATURE, signature_msg)
+    if not ok:
+        print("❌ Failed to publish signature")
+        return None
 
-    # no response within timeout
+    # wait loop
+    deadline = utime.time() + wait_seconds
+    while utime.time() < deadline:
+        # mqtt_client.check_msg will invoke callback and fill pending_matches
+        try:
+            # non-blocking check for messages
+            mqtt_client.check_msg()
+        except Exception:
+            # try reconnect once
+            if not mqtt_connect():
+                time.sleep(0.5)
+        if nonce in pending_matches:
+            match = pending_matches.pop(nonce)
+            return match
+        # small sleep
+        time.sleep_ms(200)
+    print("⚠️ No match response for nonce", nonce)
     return None
 
-def send_connected_device_to_cloud(device_info, action="connect"):
-    """
-    Publishes compact connect/disconnect event to TOPIC_CONNECTED.
-    """
+# -------------------------------------------------------------------------
+# Send connected (connect/disconnect) event to cloud
+# -------------------------------------------------------------------------
+def publish_connected_event(device_info, action="connect"):
     payload = {
         "deviceId": device_id,
         "action": action,
@@ -351,7 +365,8 @@ def send_connected_device_to_cloud(device_info, action="connect"):
     mqtt_publish(TOPIC_CONNECTED, payload)
 
 # -------------------------------------------------------------------------
-# V. NILM Detection Logic (stabilize signatures before sending)
+# NILM detection & event handling (main logic)
+# Uses debounce + transient + steady buffers similar to your NILM firmware.
 # -------------------------------------------------------------------------
 def find_best_match_for_drop(drop_watt):
     if not connected_devices:
@@ -361,15 +376,17 @@ def find_best_match_for_drop(drop_watt):
         diff = abs(info.get("powerWatt", 0.0) - drop_watt)
         if diff < best_diff:
             best_diff, best_id = diff, aid
-    # Confirmation: difference < 10W OR < 40% of device power
     if best_id and best_diff <= max(10, 0.4 * connected_devices[best_id].get("powerWatt", 0.0)):
         return best_id
     return None
 
 def detect_appliance_event(reading):
     """
-    Primary NILM engine: detect candidate step -> debounce -> capture buffers -> stabilize -> send signature.
-    Uses send_signature_and_wait_for_match() to publish stabilized signature and wait for cloud ID.
+    This function is called every reading. It:
+    - smooths power
+    - detects candidate events (step or cumulative)
+    - manages debounce and active_events buffers
+    - finalizes events after APPLIANCE_STABILIZATION_WINDOW by stabilizing and (for ON) publishing signature
     """
     global last_power_reading, debounce_active, debounce_start_time, debounce_event_type
     global debounce_buffer, cumulative_delta, active_events, connected_devices
@@ -385,9 +402,10 @@ def detect_appliance_event(reading):
     step_delta = current_power - last_power_reading
     cumulative_delta += step_delta
 
-    # --- Candidate detection triggers ---
+    # Candidate detection triggers (step or cumulative)
     trigger_now = False
     trigger_value = 0.0
+    trigger_reason = None
     if (abs(step_delta) >= POWER_CHANGE_THRESHOLD_WATT) and (not debounce_active):
         trigger_now = True
         trigger_value = step_delta
@@ -396,106 +414,69 @@ def detect_appliance_event(reading):
         trigger_now = True
         trigger_value = cumulative_delta
         trigger_reason = "cumulative"
-    else:
-        trigger_reason = None
 
     if trigger_now:
-        # Start debounce timer
         debounce_active = True
         debounce_start_time = now
         debounce_event_type = "ON" if trigger_value > 0 else "OFF"
         debounce_buffer = [current_power]
         print("⚡ Candidate", debounce_event_type, "reason=", trigger_reason, "val={:.2f}W".format(trigger_value))
-
     elif debounce_active:
-        # Collect samples during debounce
         debounce_buffer.append(current_power)
 
-    # --- Confirm after debounce window ---
+    # Confirm after debounce window
     if debounce_active and (now - debounce_start_time) >= POWER_CHANGE_DEBOUNCE_SECONDS:
-        # Calculate stability (noise) during the debounce period
-        variation = max(debounce_buffer) - min(debounce_buffer)
+        avg_power = sum(debounce_buffer) / len(debounce_buffer) if debounce_buffer else current_power
+        variation = max(debounce_buffer) - min(debounce_buffer) if debounce_buffer else 0.0
         STABILITY_THRESHOLD_W = max(1.5, STABILIZATION_VARIATION_WATT / 6.0)
-
         if variation <= STABILITY_THRESHOLD_W:
-            # Event is stable enough; confirm and prepare for signature capture
-            event = {
+            # confirm event and capture with pre_total snapshot
+            active_events.append({
                 "event_type": debounce_event_type,
                 "start_time": now,
-                "pre_total": last_power_reading, # The baseline before the event
-                "buffer": [],                   # Will collect steady-state samples
-                "transient_buffer": [],         # Will collect transient samples
-                "finalized": False,
-                "stabilization_deadline": now + APPLIANCE_STABILIZATION_WINDOW
-            }
-            active_events.append(event)
+                "pre_total": last_power_reading,
+                "buffer": [],            # steady buffer (used for stabilization)
+                "transient_buffer": [],  # initial transient buffer
+                "finalized": False
+            })
             print("✅ Confirmed event:", debounce_event_type, "pre_total={:.1f}W".format(last_power_reading))
         else:
             print("⚠️ Debounce rejected: unstable (variation={:.1f}W)".format(variation))
 
-        # Reset debounce state
+        # reset debounce
         debounce_active = False
         debounce_buffer = []
         cumulative_delta = 0.0
         debounce_event_type = None
 
-    # --- Low-power ON watcher (Dedicated path for small loads like a clip fan) ---
+    # Low-power ON watcher (e.g., clip fan) - queue a synthetic ON event for stabilization
     LOW_POWER_ON_THRESHOLD = 2.0
     LOW_POWER_SUSTAIN_SECONDS = 3
     if last_power_reading < 0.8 and current_power >= LOW_POWER_ON_THRESHOLD:
         if low_on_timer is None:
             low_on_timer = now
         elif now - low_on_timer >= LOW_POWER_SUSTAIN_SECONDS:
-            print("🌿 Low-power ON detected ({:.1f}W) - sending signature".format(current_power))
-            sig_point = {
-                "timestamp": reading["timestamp"],
-                "powerWatt": round(current_power,1),
-                "powerFactor": reading["powerFactor"],
-                "voltageVolt": reading["voltageVolt"],
-                "currentAmp": reading["currentAmp"]
-            }
-            signature_msg = {
-                "dataType": "ApplianceSignature",
-                "deviceId": device_id,
+            ev = {
                 "event_type": "ON",
-                "signature_data": [sig_point],
-                "transient_data": [sig_point],
-                "steady_state_data": [sig_point],
-                "timestamp": now,
-                "features": {"steady_avg_power": sig_point["powerWatt"], "powerFactor": sig_point["powerFactor"]}
+                "start_time": now,
+                "pre_total": last_power_reading,
+                "buffer": [],
+                "transient_buffer": [],
+                "finalized": False,
+                "low_power": True
             }
-
-            # Add a signature_id for correlation and send
-            signature_msg["signature_id"] = str(int(now)) + "_" + str(random.getrandbits(16))
-            resp = send_signature_and_wait_for_match(signature_msg, timeout_seconds=6)
-            if resp:
-                # Cloud returned a match/new id
-                aid = resp.get("applianceID")
-                if aid:
-                    connected_devices[aid] = {
-                        "name": resp.get("applianceName", "Unknown"),
-                        "powerWatt": resp.get("powerWatt", signature_msg["features"]["steady_avg_power"]),
-                        "powerFactor": signature_msg["features"]["powerFactor"],
-                        "last_seen": now
-                    }
-                    print("🔌 Low-power device registered:", connected_devices[aid]["name"], "(", aid, ")")
-                    send_connected_device_to_cloud({ "applianceID": aid, "name": connected_devices[aid]["name"],
-                                                     "powerWatt": connected_devices[aid]["powerWatt"],
-                                                     "powerFactor": connected_devices[aid]["powerFactor"] }, "connect")
-                else:
-                    print("⚠️ Low-power cloud response had no applianceID.")
-            else:
-                print("⚠️ No cloud response for low-power signature.")
+            active_events.append(ev)
+            print("🌿 Low-power ON suspected ({:.1f}W) — queued for stabilization".format(current_power))
             low_on_timer = None
     else:
         low_on_timer = None
 
-    # --- Low-power OFF watcher ---
-    total_connected_power = sum(v.get("powerWatt",0) for v in connected_devices.values())
+    # Low-power OFF clearing logic (if total connected power > 0 and reading drops very low)
+    total_connected_power = sum(v.get("powerWatt", 0) for v in connected_devices.values())
     if total_connected_power > 0 and current_power < 1.0:
         if low_off_timer is None:
             low_off_timer = now
-        elif now - low_off_timer > 5: # If power is low for 5 seconds, assume small loads turned off.
+        elif now - low_off_timer > 5:
             print("🍃 Low-power devices appear OFF -> clearing local registry")
             connected_devices.clear()
             print_connected_devices()
@@ -503,32 +484,43 @@ def detect_appliance_event(reading):
     else:
         low_off_timer = None
 
-    # --- Update active_events capturing buffers and finalize events ---
+    # Update active_events buffers and attempt finalization
     for ev in list(active_events):
-        # 1. Record transient data (only for the first few seconds)
+        # record transient (first few seconds)
         if (now - ev["start_time"]) <= TRANSIENT_CAPTURE_WINDOW:
             ev["transient_buffer"].append({
-                "timestamp": reading["timestamp"], "powerWatt": current_power, "powerFactor": reading["powerFactor"],
-                "voltageVolt": reading["voltageVolt"], "currentAmp": reading["currentAmp"]
+                "timestamp": reading["timestamp"],
+                "powerWatt": current_power,
+                "powerFactor": reading["powerFactor"],
+                "voltageVolt": reading["voltageVolt"],
+                "currentAmp": reading["currentAmp"]
             })
 
-        # 2. Always record steady state data
+        # always append to steady buffer
         ev["buffer"].append({
-            "timestamp": reading["timestamp"], "powerWatt": current_power, "powerFactor": reading["powerFactor"],
-            "voltageVolt": reading["voltageVolt"], "currentAmp": reading["currentAmp"]
+            "timestamp": reading["timestamp"],
+            "powerWatt": current_power,
+            "powerFactor": reading["powerFactor"],
+            "voltageVolt": reading["voltageVolt"],
+            "currentAmp": reading["currentAmp"]
         })
 
-        # 3. Finalize event after stabilization window
-        if not ev["finalized"] and now >= ev.get("stabilization_deadline", 0):
+        # finalize after stabilization window
+        if not ev["finalized"] and (now - ev["start_time"]) >= APPLIANCE_STABILIZATION_WINDOW:
             # compute stable average and variation
             stable_avg = sum(x["powerWatt"] for x in ev["buffer"]) / max(len(ev["buffer"]),1)
             variation = max(x["powerWatt"] for x in ev["buffer"]) - min(x["powerWatt"] for x in ev["buffer"])
-
             if variation > STABILIZATION_VARIATION_WATT:
-                # heavy-load noisy device - allow but note
-                print("⚠️ Large variation (heavy load). Variation:", variation)
-                # we still attempt to stabilize but signal it to the cloud via features
+                print("⚠️ Large variation (heavy load). Forcing finalize with tolerance.")
+                # keep going but accept higher variation
+                variation = STABILIZATION_VARIATION_WATT / 2.0
 
+            # compute slope to detect drifting loads
+            slope = compute_slope(ev["buffer"])
+
+            print("🔍 Finalize check — avg={:.2f}W var={:.2f}W slope={:.2f}W/s".format(stable_avg, variation, slope))
+
+            # Finalization behavior
             if ev["event_type"] == "ON":
                 pre = ev.get("pre_total", last_power_reading)
                 residual = stable_avg - pre
@@ -537,7 +529,7 @@ def detect_appliance_event(reading):
                     residual = 0.0
 
                 if residual >= MIN_RESIDUAL_WATT or (pre > 0 and residual >= pre * MIN_RESIDUAL_RELATIVE):
-                    # Build stabilized signature payload
+                    # Build signature message similar to NILM firmware
                     sig_point = {
                         "timestamp": ev["buffer"][-1]["timestamp"],
                         "voltageVolt": ev["buffer"][-1]["voltageVolt"],
@@ -545,6 +537,7 @@ def detect_appliance_event(reading):
                         "powerWatt": round(residual,1),
                         "powerFactor": ev["buffer"][-1]["powerFactor"]
                     }
+
                     signature_msg = {
                         "dataType": "ApplianceSignature",
                         "deviceId": device_id,
@@ -555,57 +548,69 @@ def detect_appliance_event(reading):
                         "timestamp": now,
                         "features": {
                             "steady_avg_power": round(residual,1),
-                            "powerFactor": ev["buffer"][-1]["powerFactor"],
-                            "variation": variation
+                            "powerFactor": sig_point["powerFactor"]
                         }
                     }
-                    # correlate responses with signature_id
-                    signature_msg["signature_id"] = str(int(now)) + "_" + str(random.getrandbits(16))
 
-                    print("📡 Stabilized signature ready (residual {:.1f}W). Sending to cloud...".format(sig_point["powerWatt"]))
-                    resp = send_signature_and_wait_for_match(signature_msg, timeout_seconds=6)
+                    print("📡 Publishing stabilized signature (residual {:.1f}W) & waiting for cloud match...".format(residual))
 
-                    if resp:
-                        # Cloud returned match/new id - register locally and send connect event
-                        aid = resp.get("applianceID")
-                        if aid:
-                            connected_devices[aid] = {
-                                "name": resp.get("applianceName", "Unknown"),
-                                "powerWatt": resp.get("powerWatt", signature_msg["features"]["steady_avg_power"]),
-                                "powerFactor": signature_msg["features"]["powerFactor"],
-                                "last_seen": now
-                            }
-                            # ensure applianceID is stored
-                            connected_devices[aid]["applianceID"] = aid
-                            print("🔌 Device connected:", connected_devices[aid]["name"], "(", aid, ")")
-                            # announce to cloud that it's connected (cloud may already have registered it, but keep realtime inventory updated)
-                            send_connected_device_to_cloud(connected_devices[aid], "connect")
-                            print_connected_devices()
-                        else:
-                            print("⚠️ Cloud response didn't include applianceID:", resp)
+                    match = publish_signature_and_wait_for_match(signature_msg, wait_seconds=6)
+                    if match and match.get("applianceID"):
+                        aid = match["applianceID"]
+                        aname = match.get("applianceName", "Unknown")
+                        # register locally
+                        connected_devices[aid] = {
+                            "name": aname,
+                            "powerWatt": signature_msg["features"]["steady_avg_power"],
+                            "powerFactor": signature_msg["features"]["powerFactor"],
+                            "last_seen": now
+                        }
+                        print("🔌 Device connected (matched):", aname, "(", aid, ")")
+                        print_connected_devices()
+                        # publish confirmed connect event
+                        publish_connected_event({
+                            "applianceID": aid,
+                            "name": aname,
+                            "powerWatt": signature_msg["features"]["steady_avg_power"],
+                            "powerFactor": signature_msg["features"]["powerFactor"]
+                        }, action="connect")
                     else:
-                        print("⚠️ No cloud response for stabilized signature (signature_id {}).".format(signature_msg["signature_id"]))
+                        # cloud didn't respond with match -> still send connect request WITHOUT ID
+                        print("⚠️ No matching appliance returned by cloud. Sending connect request for cloud to create record.")
+                        # allow cloud to create an appliance (cloud should reply with created applianceID on TOPIC_MATCH later)
+                        publish_connected_event({
+                            "applianceID": None,
+                            "name": "Unknown",
+                            "powerWatt": signature_msg["features"]["steady_avg_power"],
+                            "powerFactor": signature_msg["features"]["powerFactor"]
+                        }, action="connect")
                 else:
-                    print("⚠️ Residual {:.2f}W too small — no signature created.".format(residual))
+                    print("⚠️ Residual {:.2f}W too small → not creating signature.".format(residual))
 
             elif ev["event_type"] == "OFF":
-                pre = ev.get("pre_total", last_power_reading)
+                pre = ev.get("pre_total", ev["buffer"][0]["powerWatt"] if ev["buffer"] else last_power_reading)
                 drop = pre - stable_avg
                 if drop > 0:
-                    match = find_best_match_for_drop(drop)
-                    if match:
-                        info = connected_devices.pop(match, None)
+                    matched = find_best_match_for_drop(drop)
+                    if matched:
+                        info = connected_devices.pop(matched, None)
                         if info:
-                            print("❌ Device disconnected:", info.get("name","Unknown"), "(", match, ")")
-                            # send disconnect event to cloud
-                            send_connected_device_to_cloud(info, "disconnect")
+                            print("❌ Device disconnected (local match):", info.get("name","Unknown"), "(", matched, ")")
+                            # notify cloud (disconnect)
+                            publish_connected_event({
+                                "applianceID": matched,
+                                "name": info.get("name","Unknown"),
+                                "powerWatt": info.get("powerWatt",0),
+                                "powerFactor": info.get("powerFactor",0)
+                            }, action="disconnect")
                             print_connected_devices()
                     else:
-                        print("⚠️ OFF event finalized, but no matching device found for drop {:.1f}W.".format(drop))
+                        print("⚠️ OFF drop {:.1f}W didn't match any tracked device.".format(drop))
                 else:
-                    print("⚠️ OFF event but drop {:.1f}W not positive.".format(drop if 'drop' in locals() else 0.0))
+                    print("⚠️ OFF event detected but drop {:.1f}W not positive.".format(drop if 'drop' in locals() else 0.0))
+
             else:
-                print("⚠️ Unknown event_type", ev["event_type"])
+                print("⚠️ Unknown event type:", ev["event_type"])
 
             ev["finalized"] = True
             try:
@@ -616,7 +621,7 @@ def detect_appliance_event(reading):
     last_power_reading = current_power
 
 # -------------------------------------------------------------------------
-# VI. Initialization and Main Loop
+# WiFi connect
 # -------------------------------------------------------------------------
 def wifi_connect():
     sta = network.WLAN(network.STA_IF)
@@ -628,62 +633,81 @@ def wifi_connect():
         print(".", end=""); time.sleep(1); timeout += 1
     if sta.isconnected():
         print("\n✅ Wi-Fi connected:", sta.ifconfig())
-        sync_time_with_ntp()
+        # try to sync time
+        try:
+            import ntptime
+            ntptime.settime()
+            print("✅ NTP synced")
+        except Exception as e:
+            print("⚠️ NTP sync failed:", e)
         return True
     else:
         print("\n❌ Wi-Fi connection failed.")
         return False
 
-# --- Main execution block ---
-print("EnerGreen merged firmware starting...")
-if not wifi_connect():
-    print("Continuing without Wi-Fi; will retry in main loop.")
+# -------------------------------------------------------------------------
+# Main loop
+# -------------------------------------------------------------------------
+def main():
+    global mqtt_connected, mqtt_client
+    print("EnerGreen merged firmware starting...")
+    # connect wifi
+    wifi_ok = wifi_connect()
+    if not wifi_ok:
+        print("Continuing without Wi-Fi; will retry in main loop.")
 
-# connect MQTT if possible
-if network.WLAN(network.STA_IF).isconnected():
-    mqtt_connect()
+    # connect MQTT
+    if wifi_ok:
+        mqtt_connect()
 
-while True:
-    try:
-        # 1. Check for incoming MQTT messages
-        if mqtt_connected:
-            try:
-                mqtt_client.check_msg()
-            except Exception:
-                # ignore check errors; connection health handled later
-                pass
+    # ensure MQTT client is set up and subscribed
+    if mqtt_client is None or not mqtt_connected:
+        mqtt_connect()
 
-        reading = simulate_pzem_data() if USE_SIMULATED_DATA else pzem_data()
+    last_regular = 0
 
-        if reading:
-            # debug print
-            print("[Reading] {v:.1f} V | {c:.3f} A | {p:.1f} W | PF {pf:.2f}".format(
-                v=reading["voltageVolt"], c=reading["currentAmp"],
-                p=reading["powerWatt"], pf=reading["powerFactor"]))
-            detect_appliance_event(reading) # main NILM processing
-
-            # periodically publish regular reading
-            now = utime.time()
-            if now - last_regular_reading_time >= REGULAR_READING_INTERVAL_SECONDS:
-                payload = reading.copy()
-                payload["dataType"] = "RegularReading"
-                mqtt_publish(TOPIC_REGULAR, payload)
-                last_regular_reading_time = now
-
-        else:
-            print("No reading")
-
-        time.sleep(1)
-
-    except Exception as e:
-        print("Loop error:", e)
-        # recover: try reconnects
+    while True:
         try:
-            if not network.WLAN(network.STA_IF).isconnected():
-                wifi_connect()
-            if not mqtt_connected:
+            reading = simulate_pzem_data() if USE_SIMULATED_DATA else pzem_data()
+            if reading:
+                # print short reading for debug
+                print("[Reading] {v:.1f} V | {c:.3f} A | {p:.1f} W | PF {pf:.2f}".format(
+                    v=reading["voltageVolt"], c=reading["currentAmp"],
+                    p=reading["powerWatt"], pf=reading["powerFactor"]))
+                detect_appliance_event(reading)
+
+                # periodically publish regular reading
+                now = utime.time()
+                if now - last_regular >= REGULAR_READING_INTERVAL_SECONDS:
+                    payload = reading.copy()
+                    payload["dataType"] = "RegularReading"
+                    mqtt_publish(TOPIC_REGULAR, payload)
+                    last_regular = now
+            else:
+                print("No reading")
+
+            # periodically check for incoming MQTT messages (non-blocking)
+            try:
+                if mqtt_client is not None:
+                    mqtt_client.check_msg()
+            except Exception as e:
+                # reconnect if necessary
+                print("⚠️ check_msg error:", e)
                 mqtt_connect()
-        except Exception:
-            pass
-        time.sleep(5)
+
+            time.sleep(1)
+
+        except Exception as e:
+            print("Loop error:", e)
+            # try reconnects
+            try:
+                if not mqtt_connected:
+                    mqtt_connect()
+            except Exception:
+                pass
+            time.sleep(5)
+
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
 
