@@ -66,6 +66,9 @@ MIN_RESIDUAL_RELATIVE = 0.02
 
 POWER_WINDOW_SIZE = 8  # smoothing
 
+EVENT_COOLDOWN_SECONDS = 6
+event_cooldown_expiry = 0
+
 # -------------------------------------------------------------------------
 # Globals
 # -------------------------------------------------------------------------
@@ -390,11 +393,14 @@ def detect_appliance_event(reading):
     """
     global last_power_reading, debounce_active, debounce_start_time, debounce_event_type
     global debounce_buffer, cumulative_delta, active_events, connected_devices
-    global low_on_timer, low_off_timer
+    global low_on_timer, low_off_timer, event_cooldown_expiry
 
     current_power = smoothed_power(reading["powerWatt"])
     now = utime.time()
-
+    
+    if now < event_cooldown_expiry:
+        last_power_reading = current_power 
+        return
     # initialize baseline
     if last_power_reading == 0.0:
         last_power_reading = current_power
@@ -440,6 +446,8 @@ def detect_appliance_event(reading):
                 "finalized": False
             })
             print("✅ Confirmed event:", debounce_event_type, "pre_total={:.1f}W".format(last_power_reading))
+            event_cooldown_expiry = now + EVENT_COOLDOWN_SECONDS
+            print("⏳ Cooldown started for {}s".format(EVENT_COOLDOWN_SECONDS))
         else:
             print("⚠️ Debounce rejected: unstable (variation={:.1f}W)".format(variation))
 
