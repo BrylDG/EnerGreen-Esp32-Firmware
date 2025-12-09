@@ -45,6 +45,11 @@ last_reconnect_attempt = 0
 debounce_active = False
 debounce_start_time = 0
 debounce_event_type = None
+# --- Time sync state ---
+rtc_synced = False
+boot_time_at_sync = 0     # wall-clock time (seconds since epoch) recorded when NTP succeeded
+boot_ticks_at_sync = 0    # time.ticks_ms() recorded at the same moment
+
 
 # Sliding Window for Smoothing
 power_window = []
@@ -208,7 +213,8 @@ def pzem_data():
 
         return {
             "deviceId": device_id,
-            "timestamp": utime.time(),
+            "timestamp": get_timestamp(),
+            "time_synced": rtc_synced,
             "voltageVolt": round(voltage, 1),
             "currentAmp": round(current, 3),
             "powerWatt": round(power, 1),
@@ -224,6 +230,7 @@ def pzem_data():
 # 3. Network & MQTT Setup (Outbound Only) with SD flush on reconnect
 # -------------------------------------------------------------------
 def sync_time_with_ntp(max_retries=5):
+    global rtc_synced, boot_time_at_sync, boot_ticks_at_sync
     import ntptime
     servers = ['pool.ntp.org', 'time.google.com']
     print("🕒 Syncing Time...")
@@ -231,14 +238,59 @@ def sync_time_with_ntp(max_retries=5):
         for host in servers:
             try:
                 ntptime.host = host
-                ntptime.settime()
-                print(f"✅ NTP synced via {host}")
+                ntptime.settime()   # set RTC (UTC)
+                # small sanity check: get utime.localtime() year
+                year = utime.localtime()[0]
+                if year < 2000 or year > 2035:
+                    # unrealistic; keep trying
+                    print(f"⚠️ NTP gave unrealistic year {year}, continuing.")
+                    continue
+                rtc_synced = True
+                boot_time_at_sync = utime.time()
+                boot_ticks_at_sync = time.ticks_ms()
+                print(f"✅ NTP synced via {host} (year {year})")
                 return True
             except Exception as e:
                 print(f"⚠️ NTP Error ({host}): {e}")
                 time.sleep(1)
+    rtc_synced = False
     print("❌ NTP Failed.")
     return False
+
+def get_timestamp():
+    """Return a trustworthy timestamp (seconds since epoch).
+       If RTC has been synced, use utime.time().
+       If not, return an approximate monotonic-derived timestamp (boot-based).
+       Also returns a tuple (ts, synced_bool) when called with get_timestamp(True).
+    """
+    global rtc_synced, boot_time_at_sync, boot_ticks_at_sync
+    # If RTC was synced, ensure the value is sane
+    if rtc_synced:
+        try:
+            ts = utime.time()
+            year = utime.localtime(ts)[0]
+            if 1970 <= year <= 2035:
+                return ts
+            else:
+                # fallback to unsynced path
+                rtc_synced = False
+                print("⚠️ RTC returned abnormal year; treating as unsynced.")
+        except Exception as e:
+            rtc_synced = False
+            print("⚠️ Error reading RTC:", e)
+
+    # Unsynced: approximate using boot_time_at_sync if available, else use uptime base (monotonic)
+    ticks_now = time.ticks_ms()
+    if boot_time_at_sync and boot_ticks_at_sync:
+        # compute elapsed seconds since we recorded boot_time_at_sync
+        elapsed_ms = time.ticks_diff(ticks_now, boot_ticks_at_sync)
+        approx_ts = int(boot_time_at_sync + (elapsed_ms / 1000.0))
+        return approx_ts
+    else:
+        # we have no reference wall-clock; return uptime milliseconds as negative offset  (or zero)
+        # To avoid producing absurd future dates, return 0 (Unix epoch) and rely on 'time_synced' flag.
+        return 0
+
 
 def setup_wifi(timeout_seconds=20):
     sta = network.WLAN(network.STA_IF)
